@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light" />
+    <title>Relay · OTA 构建中心</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div id="toast-root" class="toast-root" aria-live="polite"></div>
+
+    <main id="login-view" class="login-view hidden">
+      <section class="login-brand" aria-label="产品介绍">
+        <div class="brand-mark brand-mark-large" aria-hidden="true">
+          <svg viewBox="0 0 40 40"><path d="M11 9.5h11.5A7.5 7.5 0 0 1 30 17v0a7.5 7.5 0 0 1-7.5 7.5H14"/><path d="m18 19-6 5.5 6 5.5"/></svg>
+        </div>
+        <p class="eyebrow light">RELAY BUILD SYSTEM</p>
+        <h1>让每一次资源更新<br />都有迹可循。</h1>
+        <p class="login-copy">面向动效与资源团队的轻量构建中心。选择资源，提交任务，剩下的交给打包机。</p>
+        <div class="login-feature-list">
+          <div><span>01</span><p><b>多路径更新</b><small>快速检索并组合资源目录</small></p></div>
+          <div><span>02</span><p><b>实时状态</b><small>构建进度与历史清晰可见</small></p></div>
+          <div><span>03</span><p><b>完整追溯</b><small>参数、人员、时间全部留档</small></p></div>
+        </div>
+      </section>
+      <section class="login-panel">
+        <form id="login-form" class="login-form" autocomplete="on">
+          <div class="mobile-brand"><span class="brand-mark"><svg viewBox="0 0 40 40"><path d="M11 9.5h11.5A7.5 7.5 0 0 1 30 17v0a7.5 7.5 0 0 1-7.5 7.5H14"/><path d="m18 19-6 5.5 6 5.5"/></svg></span>Relay</div>
+          <p class="eyebrow">WELCOME BACK</p>
+          <h2>登录构建中心</h2>
+          <p class="subtle login-subtitle">使用管理员分配的本地账号继续</p>
+          <label class="field">
+            <span>账号</span>
+            <span class="input-wrap">
+              <svg viewBox="0 0 24 24"><path d="M20 21a8 8 0 0 0-16 0"/><circle cx="12" cy="7" r="4"/></svg>
+              <input id="username" name="username" type="text" placeholder="请输入账号" autocomplete="username" required />
+            </span>
+          </label>
+          <label class="field">
+            <span>密码</span>
+            <span class="input-wrap">
+              <svg viewBox="0 0 24 24"><rect x="3" y="10" width="18" height="11" rx="2"/><path d="M7 10V7a5 5 0 0 1 10 0v3"/></svg>
+              <input id="password" name="password" type="password" placeholder="请输入密码" autocomplete="current-password" required />
+            </span>
+          </label>
+          <p id="login-error" class="form-error" role="alert"></p>
+          <button id="login-submit" class="button primary login-button" type="submit">登录 <span>→</span></button>
+          <p class="login-footnote">账号由打包机本地数据库管理</p>
+        </form>
+      </section>
+    </main>
+
+    <div id="app-view" class="app-view hidden">
+      <header class="topbar">
+        <button class="wordmark" data-nav="/" aria-label="返回首页">
+          <span class="brand-mark"><svg viewBox="0 0 40 40"><path d="M11 9.5h11.5A7.5 7.5 0 0 1 30 17v0a7.5 7.5 0 0 1-7.5 7.5H14"/><path d="m18 19-6 5.5 6 5.5"/></svg></span>
+          <span>Relay</span><small>BUILD CENTER</small>
+        </button>
+        <div class="topbar-right">
+          <span class="server-state"><i></i> 服务正常</span>
+          <span class="topbar-divider"></span>
+          <span id="user-avatar" class="avatar">U</span>
+          <span id="user-name" class="user-name">用户</span>
+          <button id="logout-button" class="icon-button" title="退出登录" aria-label="退出登录">
+            <svg viewBox="0 0 24 24"><path d="M10 17l5-5-5-5M15 12H3"/><path d="M14 3h4a3 3 0 0 1 3 3v12a3 3 0 0 1-3 3h-4"/></svg>
+          </button>
+        </div>
+      </header>
+      <div id="page-root"></div>
+    </div>
+
+    <div id="drawer-backdrop" class="drawer-backdrop hidden"></div>
+    <aside id="build-drawer" class="build-drawer" aria-hidden="true"></aside>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

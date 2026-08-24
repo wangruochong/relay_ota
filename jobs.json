@@ -1,0 +1,26 @@
+{
+  "jobs": [
+    {
+      "id": "tp1",
+      "display_name": "TP1",
+      "description": "Tripeaks 1 资源更新与 OTA 构建",
+      "resource_root": "/Users/wangruochong/Documents/working/TripeaksClient",
+      "environments": ["测试环境", "正式环境"],
+      "exclude_dirs": [".git", "node_modules", "Library", "Temp", "Artifacts"],
+      "max_search_depth": 8,
+      "command": [],
+      "simulate_seconds": 4
+    },
+    {
+      "id": "tp4",
+      "display_name": "TP4",
+      "description": "Tripeaks 4 资源更新与 OTA 构建",
+      "resource_root": "/Users/wangruochong/Documents/working/TripeaksClient",
+      "environments": ["测试环境", "正式环境"],
+      "exclude_dirs": [".git", "node_modules", "Library", "Temp", "Artifacts"],
+      "max_search_depth": 8,
+      "command": [],
+      "simulate_seconds": 4
+    }
+  ]
+}
