@@ -7,10 +7,10 @@
 - SQLite 本地账号与登录会话，密码使用随机盐 + PBKDF2-SHA256 保存
 - TP1 / TP4 Job 首页和独立构建页
 - 资源目录模糊搜索、搜索结果选择、多路径组合
-- 单构建槽队列，完整展示等待中、构建中、成功、失败状态
+- 单构建锁串行执行资源编译、Git 提交和 Jenkins OTA 触发
 - 构建者、提交/执行时间、全部参数和日志留档
 - 页面每 2 秒自动同步构建状态
-- 可配置真实构建命令；未配置时默认运行 4 秒演示构建
+- 任一步骤失败时立即中止，返回错误并生成本地失败记录
 
 ## 快速启动
 
@@ -23,31 +23,38 @@ python3 server.py add-user your_name
 然后启动服务：
 
 ```bash
+export TP_CLIENT_ROOT=/absolute/path/to/TripeaksClient
+export TP_RES_ROOT=/absolute/path/to/Resources
 python3 server.py serve --host 0.0.0.0 --port 8765
 ```
 
 浏览器访问 `http://打包机IP:8765`。数据库与构建日志会保存在 `data/` 下。
 
-## Job 与真实构建命令
-
-编辑 [jobs.json](./jobs.json) 可修改 Job、资源根目录及构建命令。`command` 是参数数组，不经过 shell，例如：
-
-```json
-{
-  "command": ["/usr/bin/python3", "/absolute/path/to/build_ota.py"]
-}
-```
-
-构建脚本可读取以下环境变量：
+## 环境变量
 
 | 环境变量 | 内容 |
 | --- | --- |
-| `OTA_JOB_ID` | Job ID，例如 `tp1` |
-| `OTA_BUILD_NUMBER` | 当前 Job 的构建编号 |
-| `OTA_RESOURCE_ROOT` | 配置的绝对资源根目录 |
-| `OTA_RESOURCE_PATHS` | 用户所选路径的 JSON 数组 |
+| `TP_CLIENT_ROOT` | TP1/TP4 共用的项目 Git 根路径，必填 |
+| `TP_RES_ROOT` | 资源目录模糊检索与路径校验的根路径，必填 |
+| `JENKINS_USER` | Jenkins 用户名，可匿名触发时不填 |
+| `JENKINS_API_TOKEN` | Jenkins API Token，与 `JENKINS_USER` 同时设置 |
 
-命令的标准输出和错误输出会合并保存到对应构建日志。退出码为 `0` 时构建成功，其他退出码为失败。
+## 构建流水线
+
+TP1 与 TP4 使用同一份 `TP_CLIENT_ROOT` 工作区，但分别切换到：
+
+- TP1：`tripeaks/beta`
+- TP4：`tripeaks4p/beta`
+
+每次构建会串行执行：
+
+1. `git reset --hard`、`git clean -fd`，切换对应主分支并拉取最新代码。
+2. 执行 `coffee compile.coffee res`，每条资源路径使用一个 `-d <path>` 参数。
+3. 执行 `git add -A`、`git commit -m res` 并推送对应主分支。
+4. 读取 Jenkins 参数定义，将 `branch` 固定为 `beta`、`alert` 固定为 `true`，其余布尔参数设为 `false`、其余参数设为空，然后调用 `buildWithParameters`。
+5. 生成最终状态的本地构建记录和日志。
+
+命令输出会合并保存到对应构建日志。步骤 1～4 任一步骤失败都会停止后续操作、生成失败记录，并将错误返回页面。
 
 ## 运行测试
 

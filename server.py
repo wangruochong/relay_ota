@@ -4,26 +4,34 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import getpass
 import hashlib
 import hmac
+import http.cookiejar
 import json
 import mimetypes
 import os
-import queue
 import secrets
+import shlex
 import sqlite3
 import subprocess
 import threading
 import time
-import traceback
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import unquote, urlparse, parse_qs
+from typing import Any, Dict, List, Optional, TextIO, Tuple
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
+from urllib.request import (
+    HTTPCookieProcessor,
+    HTTPRedirectHandler,
+    Request,
+    build_opener,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -35,6 +43,9 @@ CONFIG_PATH = BASE_DIR / "jobs.json"
 SESSION_COOKIE = "ota_session"
 SESSION_TTL_SECONDS = 12 * 60 * 60
 PASSWORD_ITERATIONS = 310_000
+GIT_TIMEOUT_SECONDS = 300
+COMPILE_TIMEOUT_SECONDS = 60 * 60
+JENKINS_TIMEOUT_SECONDS = 30
 
 
 def utc_now() -> str:
@@ -149,6 +160,18 @@ def add_user(username: str, password: str) -> None:
 def load_config() -> Dict[str, Dict[str, Any]]:
     if not CONFIG_PATH.exists():
         raise RuntimeError(f"配置文件不存在：{CONFIG_PATH}")
+    project_root_value = os.environ.get("TP_CLIENT_ROOT", "").strip()
+    resource_root_value = os.environ.get("TP_RES_ROOT", "").strip()
+    if not project_root_value:
+        raise RuntimeError("环境变量 TP_CLIENT_ROOT 未设置")
+    if not resource_root_value:
+        raise RuntimeError("环境变量 TP_RES_ROOT 未设置")
+    project_root = Path(os.path.expanduser(project_root_value)).resolve()
+    resource_root = Path(os.path.expanduser(resource_root_value)).resolve()
+    if not project_root.is_dir():
+        raise RuntimeError(f"TP_CLIENT_ROOT 目录不存在：{project_root}")
+    if not resource_root.is_dir():
+        raise RuntimeError(f"TP_RES_ROOT 目录不存在：{resource_root}")
     with CONFIG_PATH.open("r", encoding="utf-8") as file:
         payload = json.load(file)
     jobs: Dict[str, Dict[str, Any]] = {}
@@ -160,17 +183,17 @@ def load_config() -> Dict[str, Dict[str, Any]]:
             or not all(ch.isalnum() or ch in "_-" for ch in job_id)
         ):
             raise RuntimeError(f"Job id 无效或重复：{job_id!r}")
-        root = Path(os.path.expandvars(os.path.expanduser(raw["resource_root"])))
-        if not root.is_absolute():
-            root = (BASE_DIR / root).resolve()
         config = dict(raw)
-        config["resource_root"] = str(root.resolve())
+        config["project_root"] = str(project_root)
+        config["resource_root"] = str(resource_root)
         config.setdefault("display_name", job_id.upper())
         config.setdefault("description", "资源更新与 OTA 构建")
-        config.setdefault("command", [])
-        config.setdefault("simulate_seconds", 4)
         config.setdefault("exclude_dirs", [".git", "node_modules", "Library", "Temp"])
         config.setdefault("max_search_depth", 8)
+        if not str(config.get("branch", "")).strip():
+            raise RuntimeError(f"Job {job_id} 未配置主分支")
+        if not str(config.get("jenkins_job_url", "")).strip():
+            raise RuntimeError(f"Job {job_id} 未配置 Jenkins Job URL")
         jobs[job_id] = config
     return jobs
 
@@ -256,101 +279,274 @@ def build_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
     return result
 
 
-class BuildManager:
-    def __init__(self, jobs: Dict[str, Dict[str, Any]]) -> None:
-        self.jobs = jobs
-        self.pending: "queue.Queue[int]" = queue.Queue()
-        self.thread = threading.Thread(target=self._worker, daemon=True, name="build-worker")
-        self.thread.start()
+class PipelineError(RuntimeError):
+    def __init__(self, message: str, status: int = HTTPStatus.INTERNAL_SERVER_ERROR) -> None:
+        super().__init__(message)
+        self.status = status
 
-    def enqueue(self, build_id: int) -> None:
-        self.pending.put(build_id)
 
-    def _worker(self) -> None:
-        while True:
-            build_id = self.pending.get()
-            try:
-                self._run(build_id)
-            except Exception:
-                traceback.print_exc()
-                with connect_db() as conn:
-                    conn.execute(
-                        """UPDATE builds SET status='failed', finished_at=?, error_message=?
-                           WHERE id=?""",
-                        (utc_now(), "构建服务内部错误", build_id),
-                    )
-            finally:
-                self.pending.task_done()
+class NoRedirectHandler(HTTPRedirectHandler):
+    """保留 Jenkins 构建响应中的 Location，避免自动跳转后丢失队列地址。"""
 
-    def _run(self, build_id: int) -> None:
-        started_at = utc_now()
-        start_clock = time.monotonic()
-        with connect_db() as conn:
-            row = conn.execute("SELECT * FROM builds WHERE id=?", (build_id,)).fetchone()
-            if not row or row["status"] != "queued":
-                return
-            conn.execute(
-                "UPDATE builds SET status='running', started_at=? WHERE id=?",
-                (started_at, build_id),
-            )
+    def redirect_request(
+        self,
+        req: Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        return None
 
-        config = self.jobs[row["job_id"]]
-        parameters = json.loads(row["parameters_json"])
-        command = config.get("command") or []
-        log_path = LOG_DIR / f"build-{build_id}.log"
-        exit_code = 0
-        error_message: Optional[str] = None
-        try:
-            with log_path.open("w", encoding="utf-8") as log:
-                log.write(f"[{started_at}] 开始构建 {row['job_id']} #{row['build_number']}\n")
-                log.write(json.dumps(parameters, ensure_ascii=False, indent=2) + "\n\n")
-                log.flush()
-                if command:
-                    env = os.environ.copy()
-                    env.update(
-                        {
-                            "OTA_JOB_ID": row["job_id"],
-                            "OTA_BUILD_NUMBER": str(row["build_number"]),
-                            "OTA_RESOURCE_ROOT": config["resource_root"],
-                            "OTA_RESOURCE_PATHS": json.dumps(parameters["resource_paths"], ensure_ascii=False),
-                        }
-                    )
-                    process = subprocess.run(
-                        [str(part) for part in command],
-                        cwd=config.get("working_directory") or config["resource_root"],
-                        env=env,
-                        stdout=log,
-                        stderr=subprocess.STDOUT,
-                        check=False,
-                    )
-                    exit_code = process.returncode
-                else:
-                    seconds = max(0, min(float(config.get("simulate_seconds", 4)), 30))
-                    log.write("未配置 command，当前运行演示构建。\n")
-                    log.flush()
-                    time.sleep(seconds)
-                    log.write("演示构建完成。\n")
-        except Exception as exc:
-            exit_code = 1
-            error_message = f"{type(exc).__name__}: {exc}"
 
-        finished_at = utc_now()
-        duration = round(time.monotonic() - start_clock, 2)
-        status = "success" if exit_code == 0 else "failed"
-        if exit_code and not error_message:
-            error_message = f"构建命令退出码：{exit_code}"
-        with connect_db() as conn:
-            conn.execute(
-                """UPDATE builds
-                   SET status=?, finished_at=?, duration_seconds=?, error_message=?
-                   WHERE id=?""",
-                (status, finished_at, duration, error_message, build_id),
-            )
+def _log_tail(log: TextIO, limit: int = 1600) -> str:
+    log.flush()
+    try:
+        content = Path(log.name).read_text(encoding="utf-8", errors="replace")
+    except (OSError, TypeError):
+        return ""
+    lines = [line.strip() for line in content[-limit:].splitlines() if line.strip()]
+    return lines[-1] if lines else ""
+
+
+def run_command(
+    command: List[str],
+    cwd: Path,
+    log: TextIO,
+    step: str,
+    timeout: int,
+    env: Optional[Dict[str, str]] = None,
+) -> None:
+    display = shlex.join(command)
+    log.write(f"\n[{step}] $ {display}\n")
+    log.flush()
+    try:
+        result = subprocess.run(
+            command,
+            cwd=str(cwd),
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=timeout,
+        )
+    except FileNotFoundError as exc:
+        raise PipelineError(f"{step}失败：找不到命令 {command[0]}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise PipelineError(f"{step}超时（{timeout} 秒）") from exc
+    except OSError as exc:
+        raise PipelineError(f"{step}失败：{exc}") from exc
+    if result.returncode != 0:
+        detail = _log_tail(log)
+        suffix = f"：{detail}" if detail else ""
+        raise PipelineError(f"{step}失败（退出码 {result.returncode}）{suffix}")
+
+
+def _jenkins_headers() -> Dict[str, str]:
+    user = os.environ.get("JENKINS_USER", "").strip()
+    api_token = os.environ.get("JENKINS_API_TOKEN", "").strip()
+    if bool(user) != bool(api_token):
+        raise PipelineError("Jenkins 鉴权配置不完整，请同时设置 JENKINS_USER 和 JENKINS_API_TOKEN")
+    headers = {"Accept": "application/json"}
+    if user and api_token:
+        encoded = base64.b64encode(f"{user}:{api_token}".encode("utf-8")).decode("ascii")
+        headers["Authorization"] = f"Basic {encoded}"
+    return headers
+
+
+def _jenkins_error(exc: HTTPError) -> str:
+    try:
+        body = exc.read(2000).decode("utf-8", errors="replace")
+    except OSError:
+        body = ""
+    body = " ".join(body.split())
+    return body[:500] or str(exc.reason)
+
+
+def trigger_jenkins(config: Dict[str, Any], log: TextIO) -> str:
+    job_url = str(config["jenkins_job_url"]).rstrip("/")
+    headers = _jenkins_headers()
+    cookies = http.cookiejar.CookieJar()
+    opener = build_opener(HTTPCookieProcessor(cookies), NoRedirectHandler())
+
+    tree = "actions[parameterDefinitions[name,type,_class]]"
+    api_url = f"{job_url}/api/json?{urlencode({'tree': tree})}"
+    try:
+        with opener.open(Request(api_url, headers=headers), timeout=JENKINS_TIMEOUT_SECONDS) as response:
+            job_info = json.loads(response.read(2 * 1024 * 1024).decode("utf-8"))
+    except HTTPError as exc:
+        raise PipelineError(
+            f"读取 Jenkins Job 参数失败（HTTP {exc.code}）：{_jenkins_error(exc)}",
+            HTTPStatus.BAD_GATEWAY,
+        ) from exc
+    except (URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise PipelineError(f"读取 Jenkins Job 参数失败：{exc}", HTTPStatus.BAD_GATEWAY) from exc
+
+    parameter_definitions: List[Dict[str, Any]] = []
+    for action in job_info.get("actions", []):
+        if isinstance(action, dict):
+            definitions = action.get("parameterDefinitions", [])
+            if isinstance(definitions, list):
+                parameter_definitions.extend(item for item in definitions if isinstance(item, dict))
+
+    parameters: Dict[str, str] = {}
+    for definition in parameter_definitions:
+        name = str(definition.get("name", "")).strip()
+        if not name:
+            continue
+        parameter_type = str(definition.get("type") or definition.get("_class") or "")
+        parameters[name] = "false" if "Boolean" in parameter_type else ""
+    parameters["branch"] = str(config.get("jenkins_branch", "beta"))
+    parameters["alert"] = "true"
+
+    parsed = urlparse(job_url)
+    path_parts = [part for part in parsed.path.split("/") if part]
+    first_job_part = next(
+        (index for index, part in enumerate(path_parts) if part in ("job", "view")),
+        len(path_parts),
+    )
+    context_path = "/" + "/".join(path_parts[:first_job_part]) if first_job_part else ""
+    jenkins_root = f"{parsed.scheme}://{parsed.netloc}{context_path}"
+    crumb_url = f"{jenkins_root}/crumbIssuer/api/json"
+    try:
+        with opener.open(Request(crumb_url, headers=headers), timeout=JENKINS_TIMEOUT_SECONDS) as response:
+            crumb = json.loads(response.read(64 * 1024).decode("utf-8"))
+            field = str(crumb.get("crumbRequestField", "")).strip()
+            value = str(crumb.get("crumb", "")).strip()
+            if field and value:
+                headers[field] = value
+    except HTTPError as exc:
+        if exc.code != HTTPStatus.NOT_FOUND:
+            raise PipelineError(
+                f"获取 Jenkins CSRF Token 失败（HTTP {exc.code}）：{_jenkins_error(exc)}",
+                HTTPStatus.BAD_GATEWAY,
+            ) from exc
+    except (URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise PipelineError(f"获取 Jenkins CSRF Token 失败：{exc}", HTTPStatus.BAD_GATEWAY) from exc
+
+    build_url = f"{job_url}/buildWithParameters"
+    request_headers = {**headers, "Content-Type": "application/x-www-form-urlencoded"}
+    request = Request(
+        build_url,
+        data=urlencode(parameters).encode("utf-8"),
+        headers=request_headers,
+        method="POST",
+    )
+    queue_url = ""
+    try:
+        with opener.open(request, timeout=JENKINS_TIMEOUT_SECONDS) as response:
+            queue_url = response.headers.get("Location", "")
+            if not queue_url and "/queue/item/" in response.geturl():
+                queue_url = response.geturl()
+    except HTTPError as exc:
+        location = exc.headers.get("Location", "")
+        is_legacy_success = exc.code in (301, 302, 303, 307, 308) and "login" not in location.lower()
+        if not is_legacy_success:
+            raise PipelineError(
+                f"触发 Jenkins OTA 失败（HTTP {exc.code}）：{_jenkins_error(exc)}",
+                HTTPStatus.BAD_GATEWAY,
+            ) from exc
+        queue_url = location
+    except (URLError, TimeoutError) as exc:
+        raise PipelineError(f"触发 Jenkins OTA 失败：{exc}", HTTPStatus.BAD_GATEWAY) from exc
+
+    queue_url = urljoin(job_url + "/", queue_url) if queue_url else ""
+    log.write("\n[Jenkins] OTA 构建请求已受理\n")
+    log.write(f"参数：{json.dumps(parameters, ensure_ascii=False)}\n")
+    if queue_url:
+        log.write(f"队列地址：{queue_url}\n")
+    log.flush()
+    return queue_url
+
+
+def execute_build_pipeline(
+    config: Dict[str, Any], resource_paths: List[str], log: TextIO
+) -> str:
+    project_root = Path(config["project_root"])
+    branch = str(config["branch"])
+    compile_file = project_root / "compile.coffee"
+    git_dir = project_root / ".git"
+    if not git_dir.exists():
+        raise PipelineError(f"项目根路径不是 Git 仓库：{project_root}")
+    if not compile_file.is_file():
+        raise PipelineError(f"找不到资源编译脚本：{compile_file}")
+
+    command_env = os.environ.copy()
+    command_env["GIT_TERMINAL_PROMPT"] = "0"
+    run_command(["git", "reset", "--hard"], project_root, log, "清理本地修改", GIT_TIMEOUT_SECONDS, command_env)
+    run_command(["git", "clean", "-fd"], project_root, log, "清理未跟踪文件", GIT_TIMEOUT_SECONDS, command_env)
+    run_command(["git", "fetch", "origin", branch], project_root, log, "拉取远端分支", GIT_TIMEOUT_SECONDS, command_env)
+    run_command(["git", "checkout", "-B", branch, f"origin/{branch}"], project_root, log, "切换主分支", GIT_TIMEOUT_SECONDS, command_env)
+    run_command(["git", "pull", "--ff-only", "origin", branch], project_root, log, "更新主分支", GIT_TIMEOUT_SECONDS, command_env)
+
+    compile_command = ["coffee", "compile.coffee", "res"]
+    for resource_path in resource_paths:
+        compile_command.extend(["-d", resource_path])
+    run_command(compile_command, project_root, log, "资源编译", COMPILE_TIMEOUT_SECONDS, command_env)
+
+    run_command(["git", "add", "-A"], project_root, log, "暂存资源修改", GIT_TIMEOUT_SECONDS, command_env)
+    run_command(["git", "commit", "-m", "res"], project_root, log, "提交资源修改", GIT_TIMEOUT_SECONDS, command_env)
+    run_command(["git", "push", "origin", f"HEAD:{branch}"], project_root, log, "推送资源修改", GIT_TIMEOUT_SECONDS, command_env)
+    return trigger_jenkins(config, log)
+
+
+def save_build_record(
+    job_id: str,
+    user: Dict[str, Any],
+    parameters: Dict[str, Any],
+    status: str,
+    created_at: str,
+    started_at: str,
+    finished_at: str,
+    duration_seconds: float,
+    error_message: Optional[str],
+    temporary_log_path: Path,
+) -> Dict[str, Any]:
+    with connect_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        build_number = conn.execute(
+            "SELECT COALESCE(MAX(build_number), 0) + 1 FROM builds WHERE job_id=?",
+            (job_id,),
+        ).fetchone()[0]
+        cursor = conn.execute(
+            """INSERT INTO builds(
+                   job_id, build_number, user_id, status, parameters_json, created_at,
+                   started_at, finished_at, duration_seconds, error_message
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                job_id,
+                build_number,
+                user["id"],
+                status,
+                json.dumps(parameters, ensure_ascii=False),
+                created_at,
+                started_at,
+                finished_at,
+                duration_seconds,
+                error_message,
+            ),
+        )
+        build_id = int(cursor.lastrowid)
+    temporary_log_path.replace(LOG_DIR / f"build-{build_id}.log")
+    return {
+        "id": build_id,
+        "job_id": job_id,
+        "build_number": build_number,
+        "username": user["username"],
+        "status": status,
+        "parameters": parameters,
+        "created_at": created_at,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "duration_seconds": duration_seconds,
+        "error_message": error_message,
+    }
 
 
 JOBS: Dict[str, Dict[str, Any]] = {}
 PATH_INDEX: Optional[PathIndex] = None
-BUILD_MANAGER: Optional[BuildManager] = None
+BUILD_LOCK = threading.Lock()
 
 
 class AppHandler(BaseHTTPRequestHandler):
@@ -588,9 +784,13 @@ class AppHandler(BaseHTTPRequestHandler):
         if job_id not in JOBS:
             self._error(HTTPStatus.NOT_FOUND, "Job 不存在")
             return
+        assert PATH_INDEX is not None
         raw_paths = payload.get("resource_paths")
-        if not isinstance(raw_paths, list) or not 1 <= len(raw_paths) <= 20:
+        if not isinstance(raw_paths, list) or not raw_paths:
             self._error(HTTPStatus.BAD_REQUEST, "玩家资源更新路径为空")
+            return
+        if len(raw_paths) > 20:
+            self._error(HTTPStatus.BAD_REQUEST, "最多选择 20 个资源更新路径")
             return
         root = Path(JOBS[job_id]["resource_root"])
         selectable_paths = set(PATH_INDEX.paths(job_id))
@@ -620,40 +820,54 @@ class AppHandler(BaseHTTPRequestHandler):
         parameters = {
             "resource_paths": clean_paths,
             "note": note,
+            "jenkins_job_url": JOBS[job_id]["jenkins_job_url"],
         }
-        created_at = utc_now()
-        with connect_db() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            next_number = conn.execute(
-                "SELECT COALESCE(MAX(build_number), 0) + 1 FROM builds WHERE job_id=?",
-                (job_id,),
-            ).fetchone()[0]
-            cursor = conn.execute(
-                """INSERT INTO builds(job_id, build_number, user_id, status, parameters_json, created_at)
-                   VALUES (?, ?, ?, 'queued', ?, ?)""",
-                (job_id, next_number, user["id"], json.dumps(parameters, ensure_ascii=False), created_at),
+        response_status = HTTPStatus.CREATED
+        error_message: Optional[str] = None
+        with BUILD_LOCK:
+            created_at = utc_now()
+            started_at = created_at
+            start_clock = time.monotonic()
+            temporary_log_path = LOG_DIR / f".pipeline-{secrets.token_hex(12)}.log"
+            try:
+                with temporary_log_path.open("w", encoding="utf-8") as log:
+                    log.write(f"[{started_at}] 开始执行 {job_id} 资源更新流水线\n")
+                    log.write(json.dumps(parameters, ensure_ascii=False, indent=2) + "\n")
+                    queue_url = execute_build_pipeline(JOBS[job_id], clean_paths, log)
+                    if queue_url:
+                        parameters["jenkins_queue_url"] = queue_url
+            except PipelineError as exc:
+                response_status = exc.status
+                error_message = str(exc)
+            except Exception as exc:
+                response_status = HTTPStatus.INTERNAL_SERVER_ERROR
+                error_message = f"构建服务内部错误：{type(exc).__name__}: {exc}"
+
+            finished_at = utc_now()
+            duration_seconds = round(time.monotonic() - start_clock, 2)
+            status = "failed" if error_message else "success"
+            with temporary_log_path.open("a", encoding="utf-8") as log:
+                if error_message:
+                    log.write(f"\n[失败] {error_message}\n")
+                else:
+                    log.write("\n[完成] 资源已提交并成功触发 Jenkins OTA\n")
+            build = save_build_record(
+                job_id,
+                user,
+                parameters,
+                status,
+                created_at,
+                started_at,
+                finished_at,
+                duration_seconds,
+                error_message,
+                temporary_log_path,
             )
-            build_id = int(cursor.lastrowid)
-        assert BUILD_MANAGER is not None
-        BUILD_MANAGER.enqueue(build_id)
-        self._json(
-            HTTPStatus.CREATED,
-            {
-                "build": {
-                    "id": build_id,
-                    "job_id": job_id,
-                    "build_number": next_number,
-                    "username": user["username"],
-                    "status": "queued",
-                    "parameters": parameters,
-                    "created_at": created_at,
-                    "started_at": None,
-                    "finished_at": None,
-                    "duration_seconds": None,
-                    "error_message": None,
-                }
-            },
-        )
+
+        if error_message:
+            self._json(response_status, {"error": error_message, "build": build})
+        else:
+            self._json(HTTPStatus.CREATED, {"build": build})
 
     def _serve_static(self, request_path: str) -> None:
         if request_path == "/":
@@ -685,12 +899,11 @@ class AppHandler(BaseHTTPRequestHandler):
 
 
 def serve(host: str, port: int) -> None:
-    global JOBS, PATH_INDEX, BUILD_MANAGER
+    global JOBS, PATH_INDEX
     init_db()
     recover_interrupted_builds()
     JOBS = load_config()
     PATH_INDEX = PathIndex(JOBS)
-    BUILD_MANAGER = BuildManager(JOBS)
     server = ThreadingHTTPServer((host, port), AppHandler)
     print(f"OTA 构建工具已启动：http://{host}:{port}")
     print(f"已加载 Job：{', '.join(JOBS)}")
