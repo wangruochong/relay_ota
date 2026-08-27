@@ -164,14 +164,14 @@ def load_config() -> Dict[str, Dict[str, Any]]:
     resource_root_value = os.environ.get("TP_RES_ROOT", "").strip()
     if not project_root_value:
         raise RuntimeError("环境变量 TP_CLIENT_ROOT 未设置")
-    if not resource_root_value:
-        raise RuntimeError("环境变量 TP_RES_ROOT 未设置")
     project_root = Path(os.path.expanduser(project_root_value)).resolve()
-    resource_root = Path(os.path.expanduser(resource_root_value)).resolve()
+    resource_base_root = (
+        Path(os.path.expanduser(resource_root_value)).resolve()
+        if resource_root_value
+        else None
+    )
     if not project_root.is_dir():
         raise RuntimeError(f"TP_CLIENT_ROOT 目录不存在：{project_root}")
-    if not resource_root.is_dir():
-        raise RuntimeError(f"TP_RES_ROOT 目录不存在：{resource_root}")
     with CONFIG_PATH.open("r", encoding="utf-8") as file:
         payload = json.load(file)
     jobs: Dict[str, Dict[str, Any]] = {}
@@ -184,8 +184,15 @@ def load_config() -> Dict[str, Dict[str, Any]]:
         ):
             raise RuntimeError(f"Job id 无效或重复：{job_id!r}")
         config = dict(raw)
+        resource_subpath = Path(str(config.get("resource_subpath", "")).strip())
+        if not resource_subpath.parts or resource_subpath.is_absolute() or ".." in resource_subpath.parts:
+            raise RuntimeError(f"Job {job_id} 的资源子路径无效")
         config["project_root"] = str(project_root)
-        config["resource_root"] = str(resource_root)
+        config["resource_root"] = (
+            str((resource_base_root / resource_subpath).resolve())
+            if resource_base_root
+            else ""
+        )
         config.setdefault("display_name", job_id.upper())
         config.setdefault("description", "资源更新与 OTA 构建")
         config.setdefault("exclude_dirs", [".git", "node_modules", "Library", "Temp"])
@@ -208,7 +215,10 @@ class PathIndex:
 
     def _scan(self, job_id: str) -> List[str]:
         config = self.jobs[job_id]
-        root = Path(config["resource_root"])
+        root_value = str(config.get("resource_root", "")).strip()
+        if not root_value:
+            return []
+        root = Path(root_value)
         if not root.is_dir():
             return []
         excludes = set(config["exclude_dirs"])
@@ -261,11 +271,12 @@ class PathIndex:
 
 
 def public_job(config: Dict[str, Any]) -> Dict[str, Any]:
+    resource_root = str(config.get("resource_root", "")).strip()
     return {
         "id": config["id"],
         "display_name": config["display_name"],
         "description": config["description"],
-        "resource_root_name": Path(config["resource_root"]).name,
+        "resource_root_name": Path(resource_root).name if resource_root else "未配置",
     }
 
 
@@ -792,7 +803,11 @@ class AppHandler(BaseHTTPRequestHandler):
         if len(raw_paths) > 20:
             self._error(HTTPStatus.BAD_REQUEST, "最多选择 20 个资源更新路径")
             return
-        root = Path(JOBS[job_id]["resource_root"])
+        root_value = str(JOBS[job_id].get("resource_root", "")).strip()
+        if not root_value:
+            self._error(HTTPStatus.BAD_REQUEST, "资源根路径未配置")
+            return
+        root = Path(root_value)
         selectable_paths = set(PATH_INDEX.paths(job_id))
         clean_paths: List[str] = []
         for raw_path in raw_paths:

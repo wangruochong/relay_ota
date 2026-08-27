@@ -246,6 +246,10 @@ function closePathSuggestions() {
   if (index === null) return;
   clearTimeout(state.searchTimers[index]);
   state.searchVersions[index] = (state.searchVersions[index] || 0) + 1;
+  if (!state.pathSelections[index] && state.pathSlots[index]) {
+    state.pathSlots[index] = "";
+  }
+  state.suggestions[index] = [];
   state.activeSuggestion = null;
   renderPathRows();
 }

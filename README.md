@@ -24,7 +24,7 @@ python3 server.py add-user your_name
 
 ```bash
 export TP_CLIENT_ROOT=/absolute/path/to/TripeaksClient
-export TP_RES_ROOT=/absolute/path/to/Resources
+export TP_RES_ROOT=/absolute/path/to/TripeaksResources
 python3 server.py serve --host 0.0.0.0 --port 8765
 ```
 
@@ -35,7 +35,7 @@ python3 server.py serve --host 0.0.0.0 --port 8765
 | 环境变量 | 内容 |
 | --- | --- |
 | `TP_CLIENT_ROOT` | TP1/TP4 共用的项目 Git 根路径，必填 |
-| `TP_RES_ROOT` | 资源目录模糊检索与路径校验的根路径，必填 |
+| `TP_RES_ROOT` | 资源总根目录；未设置时资源路径列表为空 |
 | `JENKINS_USER` | Jenkins 用户名，可匿名触发时不填 |
 | `JENKINS_API_TOKEN` | Jenkins API Token，与 `JENKINS_USER` 同时设置 |
 
@@ -45,6 +45,11 @@ TP1 与 TP4 使用同一份 `TP_CLIENT_ROOT` 工作区，但分别切换到：
 
 - TP1：`tripeaks/beta`
 - TP4：`tripeaks4p/beta`
+
+资源搜索范围从 `TP_RES_ROOT` 拼接项目子目录得到，接口返回值均相对于对应项目资源根路径：
+
+- TP1：`ResourcesTripeasks_B/Resources`
+- TP4：`ResourcesTripeasks4P/Resources`
 
 每次构建会串行执行：
 
