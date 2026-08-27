@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import getpass
 import hashlib
 import hmac
@@ -23,7 +24,7 @@ from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TextIO, Tuple
+from typing import Any, Callable, Dict, List, Optional, TextIO, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
 from urllib.request import (
@@ -46,6 +47,9 @@ PASSWORD_ITERATIONS = 310_000
 GIT_TIMEOUT_SECONDS = 300
 COMPILE_TIMEOUT_SECONDS = 60 * 60
 JENKINS_TIMEOUT_SECONDS = 30
+JENKINS_POLL_INTERVAL_SECONDS = 3
+JENKINS_BUILD_TIMEOUT_SECONDS = 6 * 60 * 60
+JENKINS_STATUS_RETRY_ATTEMPTS = 3
 
 
 def utc_now() -> str:
@@ -471,8 +475,118 @@ def trigger_jenkins(config: Dict[str, Any], log: TextIO) -> str:
     return queue_url
 
 
+def jenkins_get_json(url: str) -> Dict[str, Any]:
+    try:
+        with build_opener().open(
+            Request(url, headers=_jenkins_headers()), timeout=JENKINS_TIMEOUT_SECONDS
+        ) as response:
+            payload = json.loads(response.read(2 * 1024 * 1024).decode("utf-8"))
+    except HTTPError as exc:
+        raise PipelineError(
+            f"查询 Jenkins 构建状态失败（HTTP {exc.code}）：{_jenkins_error(exc)}",
+            HTTPStatus.BAD_GATEWAY,
+        ) from exc
+    except (URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise PipelineError(f"查询 Jenkins 构建状态失败：{exc}", HTTPStatus.BAD_GATEWAY) from exc
+    if not isinstance(payload, dict):
+        raise PipelineError("Jenkins 状态响应格式无效", HTTPStatus.BAD_GATEWAY)
+    return payload
+
+
+def jenkins_status_json(url: str, log: TextIO) -> Dict[str, Any]:
+    for attempt in range(1, JENKINS_STATUS_RETRY_ATTEMPTS + 1):
+        try:
+            return jenkins_get_json(url)
+        except PipelineError as exc:
+            if attempt >= JENKINS_STATUS_RETRY_ATTEMPTS:
+                raise
+            log.write(
+                f"[Jenkins] 状态查询失败，{JENKINS_POLL_INTERVAL_SECONDS} 秒后重试"
+                f"（{attempt}/{JENKINS_STATUS_RETRY_ATTEMPTS}）：{exc}\n"
+            )
+            log.flush()
+            time.sleep(JENKINS_POLL_INTERVAL_SECONDS)
+    raise PipelineError("查询 Jenkins 构建状态失败")
+
+
+def jenkins_instance_url(instance_url: str, returned_url: str) -> str:
+    """Jenkins 可能返回 localhost URL，统一改用最初请求的实例地址。"""
+    instance = urlparse(instance_url)
+    candidate = urlparse(urljoin(instance_url, returned_url))
+    return candidate._replace(scheme=instance.scheme, netloc=instance.netloc).geturl()
+
+
+def wait_for_jenkins(
+    queue_url: str,
+    log: TextIO,
+    on_started: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Dict[str, Any]:
+    if not queue_url:
+        raise PipelineError("Jenkins 未返回队列地址，无法跟踪构建结果", HTTPStatus.BAD_GATEWAY)
+
+    deadline = time.monotonic() + JENKINS_BUILD_TIMEOUT_SECONDS
+    queue_api = f"{queue_url.rstrip('/')}/api/json?{urlencode({'tree': 'cancelled,why,executable[number,url]'})}"
+    build_url = ""
+    build_number: Optional[int] = None
+    last_wait_reason = ""
+    log.write("[Jenkins] 等待任务离开队列…\n")
+    log.flush()
+    while time.monotonic() < deadline:
+        queue_info = jenkins_status_json(queue_api, log)
+        if queue_info.get("cancelled"):
+            raise PipelineError("Jenkins 队列任务已取消")
+        executable = queue_info.get("executable")
+        if isinstance(executable, dict) and executable.get("url"):
+            build_url = jenkins_instance_url(queue_url, str(executable["url"]))
+            try:
+                build_number = int(executable.get("number"))
+            except (TypeError, ValueError):
+                build_number = None
+            if on_started:
+                on_started(
+                    {
+                        "jenkins_build_url": build_url,
+                        "jenkins_build_number": build_number,
+                    }
+                )
+            break
+        wait_reason = str(queue_info.get("why") or "等待 Jenkins 分配执行器")
+        if wait_reason != last_wait_reason:
+            log.write(f"[Jenkins] {wait_reason}\n")
+            log.flush()
+            last_wait_reason = wait_reason
+        time.sleep(JENKINS_POLL_INTERVAL_SECONDS)
+    if not build_url:
+        raise PipelineError(f"等待 Jenkins 任务进入构建阶段超时（{JENKINS_BUILD_TIMEOUT_SECONDS} 秒）")
+
+    log.write(f"[Jenkins] 开始执行构建：{build_url}\n")
+    log.flush()
+    build_api = f"{build_url.rstrip('/')}/api/json?{urlencode({'tree': 'number,url,building,result,duration'})}"
+    while time.monotonic() < deadline:
+        build_info = jenkins_status_json(build_api, log)
+        result = str(build_info.get("result") or "").upper()
+        if not build_info.get("building") and result:
+            duration_ms = build_info.get("duration")
+            try:
+                jenkins_duration = round(float(duration_ms) / 1000, 2)
+            except (TypeError, ValueError):
+                jenkins_duration = None
+            log.write(f"[Jenkins] 构建结束，结果：{result}\n")
+            log.flush()
+            return {
+                "jenkins_build_url": jenkins_instance_url(
+                    queue_url, str(build_info.get("url") or build_url)
+                ),
+                "jenkins_build_number": build_info.get("number", build_number),
+                "jenkins_result": result,
+                "jenkins_duration_seconds": jenkins_duration,
+            }
+        time.sleep(JENKINS_POLL_INTERVAL_SECONDS)
+    raise PipelineError(f"等待 Jenkins 构建结束超时（{JENKINS_BUILD_TIMEOUT_SECONDS} 秒）")
+
+
 def execute_build_pipeline(
-    config: Dict[str, Any], resource_paths: List[str], log: TextIO
+    config: Dict[str, Any], resource_paths: List[str], note: str, log: TextIO
 ) -> str:
     project_root = Path(config["project_root"])
     branch = str(config["branch"])
@@ -497,23 +611,29 @@ def execute_build_pipeline(
     run_command(compile_command, project_root, log, "资源编译", COMPILE_TIMEOUT_SECONDS, command_env)
 
     run_command(["git", "add", "-A"], project_root, log, "暂存资源修改", GIT_TIMEOUT_SECONDS, command_env)
-    run_command(["git", "commit", "-m", "res"], project_root, log, "提交资源修改", GIT_TIMEOUT_SECONDS, command_env)
+    commit_message = f"res:{note}" if note else "res"
+    run_command(["git", "commit", "-m", commit_message], project_root, log, "提交资源修改", GIT_TIMEOUT_SECONDS, command_env)
     run_command(["git", "push", "origin", f"HEAD:{branch}"], project_root, log, "推送资源修改", GIT_TIMEOUT_SECONDS, command_env)
     return trigger_jenkins(config, log)
 
 
-def save_build_record(
+def get_build_record(build_id: int) -> Optional[Dict[str, Any]]:
+    with connect_db() as conn:
+        row = conn.execute(
+            """SELECT builds.*, users.username
+               FROM builds JOIN users ON users.id=builds.user_id
+               WHERE builds.id=?""",
+            (build_id,),
+        ).fetchone()
+    return build_to_dict(row) if row else None
+
+
+def create_build_record(
     job_id: str,
     user: Dict[str, Any],
     parameters: Dict[str, Any],
-    status: str,
-    created_at: str,
-    started_at: str,
-    finished_at: str,
-    duration_seconds: float,
-    error_message: Optional[str],
-    temporary_log_path: Path,
 ) -> Dict[str, Any]:
+    created_at = utc_now()
     with connect_db() as conn:
         conn.execute("BEGIN IMMEDIATE")
         build_number = conn.execute(
@@ -529,35 +649,135 @@ def save_build_record(
                 job_id,
                 build_number,
                 user["id"],
-                status,
+                "queued",
                 json.dumps(parameters, ensure_ascii=False),
                 created_at,
-                started_at,
-                finished_at,
-                duration_seconds,
-                error_message,
+                None,
+                None,
+                None,
+                None,
             ),
         )
         build_id = int(cursor.lastrowid)
-    temporary_log_path.replace(LOG_DIR / f"build-{build_id}.log")
-    return {
-        "id": build_id,
-        "job_id": job_id,
-        "build_number": build_number,
-        "username": user["username"],
-        "status": status,
-        "parameters": parameters,
-        "created_at": created_at,
-        "started_at": started_at,
-        "finished_at": finished_at,
-        "duration_seconds": duration_seconds,
-        "error_message": error_message,
-    }
+    build = get_build_record(build_id)
+    assert build is not None
+    return build
+
+
+def mark_build_running(build_id: int) -> None:
+    with connect_db() as conn:
+        conn.execute(
+            """UPDATE builds SET status='running', started_at=COALESCE(started_at, ?)
+               WHERE id=? AND status='queued'""",
+            (utc_now(), build_id),
+        )
+
+
+def update_build_parameters(build_id: int, parameters: Dict[str, Any]) -> None:
+    with connect_db() as conn:
+        conn.execute(
+            "UPDATE builds SET parameters_json=? WHERE id=?",
+            (json.dumps(parameters, ensure_ascii=False), build_id),
+        )
+
+
+def finish_build(build_id: int, status: str, duration_seconds: float, error_message: Optional[str]) -> None:
+    with connect_db() as conn:
+        conn.execute(
+            """UPDATE builds
+               SET status=?, finished_at=?, duration_seconds=?, error_message=?
+               WHERE id=?""",
+            (status, utc_now(), duration_seconds, error_message, build_id),
+        )
+
+
+class BuildManager:
+    """串行执行共享工作区上的构建，并在后台跟踪 Jenkins 最终结果。"""
+
+    def __init__(self) -> None:
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ota-build")
+        self._lock = threading.Lock()
+        self._pending: List[int] = []
+
+    def enqueue(self, build_id: int) -> Dict[str, Any]:
+        with self._lock:
+            starts_immediately = not self._pending
+            self._pending.append(build_id)
+            if starts_immediately:
+                mark_build_running(build_id)
+            try:
+                self._executor.submit(self._run, build_id)
+            except Exception:
+                self._pending.remove(build_id)
+                raise
+        build = get_build_record(build_id)
+        assert build is not None
+        return build
+
+    def shutdown(self) -> None:
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def _run(self, build_id: int) -> None:
+        start_clock = time.monotonic()
+        error_message: Optional[str] = None
+        status = "failed"
+        log_path = LOG_DIR / f"build-{build_id}.log"
+        try:
+            mark_build_running(build_id)
+            build = get_build_record(build_id)
+            if not build:
+                raise PipelineError("本地构建记录不存在")
+            parameters = dict(build["parameters"])
+            resource_paths = list(parameters.get("resource_paths") or [])
+            note = str(parameters.get("note") or "")
+            config = JOBS[build["job_id"]]
+            with log_path.open("w", encoding="utf-8") as log:
+                log.write(f"[{utc_now()}] 开始执行 {build['job_id']} 资源更新流水线\n")
+                log.write(json.dumps(parameters, ensure_ascii=False, indent=2) + "\n")
+                log.flush()
+                queue_url = execute_build_pipeline(config, resource_paths, note, log)
+                parameters["jenkins_queue_url"] = queue_url
+                update_build_parameters(build_id, parameters)
+
+                def record_jenkins_start(details: Dict[str, Any]) -> None:
+                    parameters.update(details)
+                    update_build_parameters(build_id, parameters)
+
+                jenkins_details = wait_for_jenkins(queue_url, log, record_jenkins_start)
+                parameters.update(jenkins_details)
+                update_build_parameters(build_id, parameters)
+                if jenkins_details["jenkins_result"] != "SUCCESS":
+                    raise PipelineError(
+                        f"Jenkins OTA 构建失败，结果：{jenkins_details['jenkins_result']}"
+                    )
+                log.write("\n[完成] 资源已提交，Jenkins OTA 构建成功\n")
+                log.flush()
+                status = "success"
+        except PipelineError as exc:
+            error_message = str(exc)
+        except Exception as exc:
+            error_message = f"构建服务内部错误：{type(exc).__name__}: {exc}"
+        finally:
+            if error_message:
+                try:
+                    with log_path.open("a", encoding="utf-8") as log:
+                        log.write(f"\n[失败] {error_message}\n")
+                except OSError:
+                    pass
+            finish_build(
+                build_id,
+                status,
+                round(time.monotonic() - start_clock, 2),
+                error_message,
+            )
+            with self._lock:
+                if build_id in self._pending:
+                    self._pending.remove(build_id)
 
 
 JOBS: Dict[str, Dict[str, Any]] = {}
 PATH_INDEX: Optional[PathIndex] = None
-BUILD_LOCK = threading.Lock()
+BUILD_MANAGER: Optional[BuildManager] = None
 
 
 class AppHandler(BaseHTTPRequestHandler):
@@ -837,52 +1057,19 @@ class AppHandler(BaseHTTPRequestHandler):
             "note": note,
             "jenkins_job_url": JOBS[job_id]["jenkins_job_url"],
         }
-        response_status = HTTPStatus.CREATED
-        error_message: Optional[str] = None
-        with BUILD_LOCK:
-            created_at = utc_now()
-            started_at = created_at
-            start_clock = time.monotonic()
-            temporary_log_path = LOG_DIR / f".pipeline-{secrets.token_hex(12)}.log"
-            try:
-                with temporary_log_path.open("w", encoding="utf-8") as log:
-                    log.write(f"[{started_at}] 开始执行 {job_id} 资源更新流水线\n")
-                    log.write(json.dumps(parameters, ensure_ascii=False, indent=2) + "\n")
-                    queue_url = execute_build_pipeline(JOBS[job_id], clean_paths, log)
-                    if queue_url:
-                        parameters["jenkins_queue_url"] = queue_url
-            except PipelineError as exc:
-                response_status = exc.status
-                error_message = str(exc)
-            except Exception as exc:
-                response_status = HTTPStatus.INTERNAL_SERVER_ERROR
-                error_message = f"构建服务内部错误：{type(exc).__name__}: {exc}"
-
-            finished_at = utc_now()
-            duration_seconds = round(time.monotonic() - start_clock, 2)
-            status = "failed" if error_message else "success"
-            with temporary_log_path.open("a", encoding="utf-8") as log:
-                if error_message:
-                    log.write(f"\n[失败] {error_message}\n")
-                else:
-                    log.write("\n[完成] 资源已提交并成功触发 Jenkins OTA\n")
-            build = save_build_record(
-                job_id,
-                user,
-                parameters,
-                status,
-                created_at,
-                started_at,
-                finished_at,
-                duration_seconds,
-                error_message,
-                temporary_log_path,
+        assert BUILD_MANAGER is not None
+        build = create_build_record(job_id, user, parameters)
+        try:
+            build = BUILD_MANAGER.enqueue(build["id"])
+        except Exception as exc:
+            error_message = f"构建任务入队失败：{type(exc).__name__}: {exc}"
+            finish_build(build["id"], "failed", 0, error_message)
+            self._json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"error": error_message, "build": get_build_record(build["id"])},
             )
-
-        if error_message:
-            self._json(response_status, {"error": error_message, "build": build})
-        else:
-            self._json(HTTPStatus.CREATED, {"build": build})
+            return
+        self._json(HTTPStatus.CREATED, {"build": build})
 
     def _serve_static(self, request_path: str) -> None:
         if request_path == "/":
@@ -914,11 +1101,12 @@ class AppHandler(BaseHTTPRequestHandler):
 
 
 def serve(host: str, port: int) -> None:
-    global JOBS, PATH_INDEX
+    global JOBS, PATH_INDEX, BUILD_MANAGER
     init_db()
     recover_interrupted_builds()
     JOBS = load_config()
     PATH_INDEX = PathIndex(JOBS)
+    BUILD_MANAGER = BuildManager()
     server = ThreadingHTTPServer((host, port), AppHandler)
     print(f"OTA 构建工具已启动：http://{host}:{port}")
     print(f"已加载 Job：{', '.join(JOBS)}")
@@ -928,6 +1116,7 @@ def serve(host: str, port: int) -> None:
         print("\n服务已停止")
     finally:
         server.server_close()
+        BUILD_MANAGER.shutdown()
 
 
 def main() -> None:
