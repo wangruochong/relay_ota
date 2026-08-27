@@ -243,7 +243,6 @@ def public_job(config: Dict[str, Any]) -> Dict[str, Any]:
         "display_name": config["display_name"],
         "description": config["description"],
         "resource_root_name": Path(config["resource_root"]).name,
-        "environments": config.get("environments", ["测试环境", "正式环境"]),
     }
 
 
@@ -314,8 +313,6 @@ class BuildManager:
                             "OTA_BUILD_NUMBER": str(row["build_number"]),
                             "OTA_RESOURCE_ROOT": config["resource_root"],
                             "OTA_RESOURCE_PATHS": json.dumps(parameters["resource_paths"], ensure_ascii=False),
-                            "OTA_ENVIRONMENT": str(parameters.get("environment", "")),
-                            "OTA_VERSION": str(parameters.get("version", "")),
                         }
                     )
                     process = subprocess.run(
@@ -593,9 +590,10 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         raw_paths = payload.get("resource_paths")
         if not isinstance(raw_paths, list) or not 1 <= len(raw_paths) <= 20:
-            self._error(HTTPStatus.BAD_REQUEST, "请选择 1～20 个资源路径")
+            self._error(HTTPStatus.BAD_REQUEST, "玩家资源更新路径为空")
             return
         root = Path(JOBS[job_id]["resource_root"])
+        selectable_paths = set(PATH_INDEX.paths(job_id))
         clean_paths: List[str] = []
         for raw_path in raw_paths:
             relative = str(raw_path).strip().replace("\\", "/").strip("/")
@@ -610,22 +608,17 @@ class AppHandler(BaseHTTPRequestHandler):
             if not candidate.is_dir():
                 self._error(HTTPStatus.BAD_REQUEST, f"资源目录不存在：{relative}")
                 return
+            if relative not in selectable_paths:
+                self._error(HTTPStatus.BAD_REQUEST, f"资源路径必须从搜索结果中选择：{relative}")
+                return
             clean_paths.append(relative)
         if not clean_paths:
-            self._error(HTTPStatus.BAD_REQUEST, "至少选择一个有效资源路径")
+            self._error(HTTPStatus.BAD_REQUEST, "玩家资源更新路径为空")
             return
 
-        environment = str(payload.get("environment", "")).strip()
-        allowed_environments = JOBS[job_id].get("environments", ["测试环境", "正式环境"])
-        if environment not in allowed_environments:
-            self._error(HTTPStatus.BAD_REQUEST, "构建环境无效")
-            return
-        version = str(payload.get("version", "")).strip()[:64]
         note = str(payload.get("note", "")).strip()[:500]
         parameters = {
             "resource_paths": clean_paths,
-            "environment": environment,
-            "version": version,
             "note": note,
         }
         created_at = utc_now()

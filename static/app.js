@@ -159,7 +159,7 @@ function breadcrumbs(job) {
 
 async function renderJob(jobId) {
   const root = document.querySelector("#page-root");
-  root.innerHTML = `<main class="page job-page"><div class="empty-state">正在加载构建配置…</div></main>`;
+  root.innerHTML = `<main class="page job-page"><div class="empty-state">正在加载构建信息…</div></main>`;
   try {
     const [jobPayload, buildsPayload] = await Promise.all([
       api(`/api/jobs/${encodeURIComponent(jobId)}`),
@@ -178,7 +178,7 @@ async function renderJob(jobId) {
       <div class="job-header"><div class="job-title"><span class="job-monogram">${escapeHTML(state.currentJob.display_name.slice(0, 3))}</span><div><h1>${escapeHTML(state.currentJob.display_name)}</h1><p>${escapeHTML(state.currentJob.description)} · 根目录 ${escapeHTML(state.currentJob.resource_root_name)}</p></div></div><span class="server-state"><i></i> 可构建</span></div>
       <div class="job-layout">
         <aside class="panel build-sidebar"><div class="panel-header"><h2>构建记录</h2><span id="build-count" class="build-count">${state.builds.length}</span></div><label class="build-filter"><span class="input-wrap"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="build-filter" placeholder="筛选编号或构建者" /></span></label><div id="build-list" class="build-list"></div></aside>
-        <section class="panel build-form-panel"><div class="form-heading"><p class="eyebrow">NEW BUILD</p><h2>创建资源更新任务</h2><p>确认资源范围与目标环境后提交构建</p></div>${buildFormHTML()}</section>
+        <section class="panel build-form-panel"><div class="form-heading"><p class="eyebrow">NEW BUILD</p><h2>创建资源更新任务</h2><p>确认资源范围后提交构建</p></div>${buildFormHTML()}</section>
       </div>
     </main>`;
     renderBuildList();
@@ -190,13 +190,8 @@ async function renderJob(jobId) {
 }
 
 function buildFormHTML() {
-  const environments = state.currentJob.environments.map(value => `<option value="${escapeHTML(value)}">${escapeHTML(value)}</option>`).join("");
   return `<form id="build-form" class="build-form">
     <section class="form-section"><div class="section-heading"><div><h3>资源更新路径 <span class="subtle">*</span></h3><p>输入关键词检索目录，支持同时更新多个路径</p></div><button id="add-path" class="add-path-button" type="button"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>添加路径</button></div><div id="path-rows"></div><div id="selected-paths"></div></section>
-    <section class="form-section"><div class="section-heading"><div><h3>构建配置</h3><p>选择 OTA 的发布目标与可选版本标识</p></div></div><div class="form-grid">
-      <label><span class="field-label">目标环境 <span class="subtle">*</span></span><span class="select-wrap"><select id="environment" required>${environments}</select><svg viewBox="0 0 24 24"><path d="m7 10 5 5 5-5"/></svg></span></label>
-      <label><span class="field-label">版本标识</span><input id="version" class="plain-input" maxlength="64" placeholder="例如 v225410（可选）" /></label>
-    </div></section>
     <section class="form-section"><label><span class="field-label">构建说明</span><textarea id="note" maxlength="500" placeholder="简要说明本次更新内容，方便团队成员追溯（可选）"></textarea></label></section>
     <div class="form-footer"><span class="form-footer-note"><svg viewBox="0 0 24 24"><path d="M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20Z"/><path d="M12 16v-4M12 8h.01"/></svg>提交后任务将进入打包机队列</span><button id="build-submit" class="button primary build-submit" type="submit">开始构建 <span>→</span></button></div>
   </form>`;
@@ -206,12 +201,13 @@ function renderPathRows() {
   const root = document.querySelector("#path-rows");
   if (!root) return;
   root.innerHTML = state.pathSlots.map((value, index) => {
+    const selected = Boolean(value && state.pathSelections[index]);
     const suggestions = state.suggestions[index] || [];
-    const show = state.activeSuggestion === index;
+    const show = state.activeSuggestion === index && !selected;
     const list = suggestions.length
-      ? suggestions.map(path => `<button class="suggestion-item" type="button" data-select-path="${index}" data-path="${escapeHTML(path)}">${icons.folder}<span>${escapeHTML(path)}</span></button>`).join("")
+      ? suggestions.map(path => `<button class="suggestion-item" type="button" role="option" data-select-path="${index}" data-path="${escapeHTML(path)}">${icons.folder}<span>${escapeHTML(path)}</span></button>`).join("")
       : '<div class="suggestion-empty">未找到匹配目录</div>';
-    return `<div class="path-row"><span class="path-index">${String(index + 1).padStart(2, "0")}</span><div class="path-input-wrap"><span class="input-wrap"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input class="path-input" data-path-index="${index}" value="${escapeHTML(value)}" placeholder="搜索资源目录，如 ResourcesCommon" autocomplete="off" /></span>${show ? `<div class="path-suggestions">${list}</div>` : ""}</div><button class="remove-path" data-remove-path="${index}" type="button" aria-label="删除路径" ${state.pathSlots.length === 1 ? "disabled" : ""}><svg viewBox="0 0 24 24"><path d="M5 12h14"/></svg></button></div>`;
+    return `<div class="path-row"><span class="path-index">${String(index + 1).padStart(2, "0")}</span><div class="path-input-wrap${selected ? " is-selected" : ""}"><span class="input-wrap"><svg viewBox="0 0 24 24">${selected ? '<path d="m7 12 3.2 3.2L17 8.5"/>' : '<circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/>'}</svg><input class="path-input" role="combobox" aria-autocomplete="list" aria-expanded="${show}" data-path-index="${index}" value="${escapeHTML(value)}" placeholder="搜索资源目录，如 ResourcesCommon" autocomplete="off" ${selected ? "readonly" : ""} />${selected ? `<button class="clear-path-selection" data-clear-path="${index}" type="button" title="重新选择" aria-label="重新选择资源路径">${icons.failed}</button>` : ""}</span>${show ? `<div class="path-suggestions" role="listbox">${list}</div>` : ""}</div><button class="remove-path" data-remove-path="${index}" type="button" aria-label="删除路径" ${state.pathSlots.length === 1 ? "disabled" : ""}><svg viewBox="0 0 24 24"><path d="M5 12h14"/></svg></button></div>`;
   }).join("");
   const selected = state.pathSlots.filter((value, index) => value && state.pathSelections[index]);
   document.querySelector("#selected-paths").innerHTML = selected.length ? `<div class="selected-paths"><span class="selected-label">已选择 ${selected.length} 个路径</span><div class="path-chips">${selected.map(path => `<span class="path-chip">${icons.folder}<span>${escapeHTML(path)}</span></span>`).join("")}</div></div>` : "";
@@ -219,24 +215,35 @@ function renderPathRows() {
 
 function searchPath(index, query) {
   clearTimeout(state.searchTimers[index]);
-  const version = (state.searchVersions[index] || 0) + 1;
-  state.searchVersions[index] = version;
+  if (state.pathSelections[index]) return;
+  state.activeSuggestion = index;
+  const requestVersion = (state.searchVersions[index] || 0) + 1;
+  state.searchVersions[index] = requestVersion;
   state.searchTimers[index] = setTimeout(async () => {
     try {
       const result = await api(`/api/jobs/${encodeURIComponent(state.currentJob.id)}/paths?q=${encodeURIComponent(query)}`);
-      if (state.searchVersions[index] !== version) return;
+      if (state.searchVersions[index] !== requestVersion || state.activeSuggestion !== index) return;
       state.suggestions[index] = result.paths.filter(path => !state.pathSlots.some((value, slot) => slot !== index && state.pathSelections[slot] && value === path));
-      state.activeSuggestion = index;
+      const restoreFocus = document.activeElement?.dataset.pathIndex === String(index);
+      if (restoreFocus) state.suppressPathFocus = true;
       renderPathRows();
       const input = document.querySelector(`[data-path-index="${index}"]`);
-      if (input) {
-        state.suppressPathFocus = true;
+      if (input && restoreFocus) {
         input.focus();
         input.setSelectionRange(input.value.length, input.value.length);
-        state.suppressPathFocus = false;
       }
+      state.suppressPathFocus = false;
     } catch (error) { toast(error.message, "error"); }
   }, 180);
+}
+
+function closePathSuggestions() {
+  const index = state.activeSuggestion;
+  if (index === null) return;
+  clearTimeout(state.searchTimers[index]);
+  state.searchVersions[index] = (state.searchVersions[index] || 0) + 1;
+  state.activeSuggestion = null;
+  renderPathRows();
 }
 
 function buildListItem(build) {
@@ -274,8 +281,15 @@ async function submitBuild(event) {
   event.preventDefault();
   const resourcePaths = state.pathSlots.filter((value, index) => value && state.pathSelections[index]);
   if (!resourcePaths.length) {
-    toast("请先从搜索结果中选择至少一个资源路径", "error");
+    const hasInput = state.pathSlots.some(value => value.trim());
+    toast(hasInput ? "请从模糊匹配列表中选择资源更新路径" : "玩家资源更新路径为空", "error");
     document.querySelector(".path-input")?.focus();
+    return;
+  }
+  const unselectedIndex = state.pathSlots.findIndex((value, index) => value.trim() && !state.pathSelections[index]);
+  if (unselectedIndex >= 0) {
+    toast("请从模糊匹配列表中选择资源更新路径", "error");
+    document.querySelector(`[data-path-index="${unselectedIndex}"]`)?.focus();
     return;
   }
   const button = document.querySelector("#build-submit");
@@ -286,14 +300,11 @@ async function submitBuild(event) {
       method: "POST",
       body: JSON.stringify({
         resource_paths: resourcePaths,
-        environment: document.querySelector("#environment").value,
-        version: document.querySelector("#version").value,
         note: document.querySelector("#note").value,
       }),
     });
     state.builds.unshift(payload.build);
     renderBuildList();
-    document.querySelector("#version").value = "";
     document.querySelector("#note").value = "";
     toast(`构建 #${payload.build.build_number} 已进入队列`);
     openBuildDrawer(payload.build.id);
@@ -328,7 +339,7 @@ async function renderDrawer(build, loadLog) {
   drawer.innerHTML = `<div class="drawer-top"><div><p>BUILD DETAILS</p><h2>#${build.build_number} 构建详情</h2></div><button class="icon-button drawer-close" aria-label="关闭">${icons.failed}</button></div>
     <div class="drawer-status">${statusHTML(build.status, true)}<div><h3>${status.label}</h3><p>${build.status === "running" ? "打包机正在处理当前任务" : build.status === "queued" ? "任务正在等待空闲构建槽" : `耗时 ${duration(build.duration_seconds)}`}</p></div></div>
     <section class="detail-section"><h3>基础信息</h3><dl class="detail-grid"><div class="detail-row"><dt>构建项目</dt><dd>${escapeHTML(build.job_id.toUpperCase())}</dd></div><div class="detail-row"><dt>构建者</dt><dd>${escapeHTML(build.username)}</dd></div><div class="detail-row"><dt>提交时间</dt><dd>${formatDate(build.created_at)}</dd></div><div class="detail-row"><dt>开始时间</dt><dd>${formatDate(build.started_at)}</dd></div><div class="detail-row"><dt>完成时间</dt><dd>${formatDate(build.finished_at)}</dd></div>${build.error_message ? `<div class="detail-row"><dt>失败原因</dt><dd>${escapeHTML(build.error_message)}</dd></div>` : ""}</dl></section>
-    <section class="detail-section"><h3>构建参数</h3><dl class="detail-grid"><div class="detail-row"><dt>资源路径</dt><dd><span class="detail-paths">${(build.parameters.resource_paths || []).map(path => `<span class="detail-path">${escapeHTML(path)}</span>`).join("")}</span></dd></div><div class="detail-row"><dt>目标环境</dt><dd>${escapeHTML(build.parameters.environment || "—")}</dd></div><div class="detail-row"><dt>版本标识</dt><dd>${escapeHTML(build.parameters.version || "—")}</dd></div><div class="detail-row"><dt>构建说明</dt><dd>${escapeHTML(build.parameters.note || "—")}</dd></div></dl></section>
+    <section class="detail-section"><h3>构建参数</h3><dl class="detail-grid"><div class="detail-row"><dt>资源路径</dt><dd><span class="detail-paths">${(build.parameters.resource_paths || []).map(path => `<span class="detail-path">${escapeHTML(path)}</span>`).join("")}</span></dd></div><div class="detail-row"><dt>构建说明</dt><dd>${escapeHTML(build.parameters.note || "—")}</dd></div></dl></section>
     <section class="detail-section"><h3>构建日志</h3><pre id="build-log" class="log-box">${loadLog ? "正在加载日志…" : "日志随状态自动更新…"}</pre></section>`;
   if (loadLog || ["success", "failed"].includes(build.status)) {
     try {
@@ -372,6 +383,7 @@ document.addEventListener("submit", event => {
 });
 
 document.addEventListener("click", event => {
+  if (!event.target.closest(".path-input-wrap")) closePathSuggestions();
   const nav = event.target.closest("[data-nav]");
   if (nav) navigate(nav.dataset.nav);
   const jobRow = event.target.closest("[data-job-id]");
@@ -399,6 +411,18 @@ document.addEventListener("click", event => {
     state.pathSelections[index] = true;
     state.activeSuggestion = null; renderPathRows();
   }
+  const clearSelection = event.target.closest("[data-clear-path]");
+  if (clearSelection) {
+    const index = Number(clearSelection.dataset.clearPath);
+    clearTimeout(state.searchTimers[index]);
+    state.searchVersions[index] = (state.searchVersions[index] || 0) + 1;
+    state.pathSlots[index] = "";
+    state.pathSelections[index] = false;
+    state.suggestions[index] = [];
+    state.activeSuggestion = null;
+    renderPathRows();
+    document.querySelector(`[data-path-index="${index}"]`)?.focus();
+  }
 });
 
 document.addEventListener("input", event => {
@@ -418,8 +442,19 @@ document.addEventListener("focusin", event => {
   if (!state.suppressPathFocus && event.target.matches(".path-input")) searchPath(Number(event.target.dataset.pathIndex), event.target.value);
 });
 
+document.addEventListener("focusout", event => {
+  if (state.suppressPathFocus || !event.target.matches(".path-input")) return;
+  const wrapper = event.target.closest(".path-input-wrap");
+  if (!wrapper?.contains(event.relatedTarget)) closePathSuggestions();
+});
+
 document.addEventListener("keydown", event => {
-  if (event.key === "Escape") { state.activeSuggestion = null; renderPathRows(); closeDrawer(); }
+  if (event.key === "Escape" && state.activeSuggestion !== null) {
+    event.preventDefault();
+    closePathSuggestions();
+    return;
+  }
+  if (event.key === "Escape") closeDrawer();
   const jobRow = event.target.closest?.("[data-job-id]");
   if (jobRow && (event.key === "Enter" || event.key === " ")) navigate(`/jobs/${encodeURIComponent(jobRow.dataset.jobId)}`);
 });

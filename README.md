@@ -30,7 +30,7 @@ python3 server.py serve --host 0.0.0.0 --port 8765
 
 ## Job 与真实构建命令
 
-编辑 [jobs.json](./jobs.json) 可修改 Job、资源根目录、环境列表及构建命令。`command` 是参数数组，不经过 shell，例如：
+编辑 [jobs.json](./jobs.json) 可修改 Job、资源根目录及构建命令。`command` 是参数数组，不经过 shell，例如：
 
 ```json
 {
@@ -46,8 +46,6 @@ python3 server.py serve --host 0.0.0.0 --port 8765
 | `OTA_BUILD_NUMBER` | 当前 Job 的构建编号 |
 | `OTA_RESOURCE_ROOT` | 配置的绝对资源根目录 |
 | `OTA_RESOURCE_PATHS` | 用户所选路径的 JSON 数组 |
-| `OTA_ENVIRONMENT` | 目标环境 |
-| `OTA_VERSION` | 可选版本标识 |
 
 命令的标准输出和错误输出会合并保存到对应构建日志。退出码为 `0` 时构建成功，其他退出码为失败。
 

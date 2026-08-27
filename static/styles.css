@@ -177,6 +177,12 @@ svg { fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round
 .path-input-wrap .input-wrap { height: 43px; }
 .path-input-wrap .input-wrap svg { width: 17px; height: 17px; }
 .path-input-wrap input { font-size: 12px; }
+.path-input-wrap.is-selected .input-wrap { border-color: #bcd8d1; background: #f7fbf9; }
+.path-input-wrap.is-selected .input-wrap > svg { color: var(--green); }
+.path-input-wrap.is-selected input[readonly] { color: #27564b; cursor: default; }
+.clear-path-selection { flex: 0 0 auto; width: 25px; height: 25px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 6px; color: #7d8986; background: transparent; cursor: pointer; }
+.clear-path-selection:hover { color: var(--red); background: var(--red-soft); }
+.clear-path-selection svg { width: 14px; height: 14px; }
 .remove-path { width: 31px; height: 31px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 7px; color: #9aa4a1; background: transparent; cursor: pointer; }
 .remove-path:hover { color: var(--red); background: var(--red-soft); }
 .remove-path:disabled { opacity: .25; cursor: default; background: transparent; }
@@ -192,15 +198,9 @@ svg { fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round
 .path-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 6px 9px; border-radius: 7px; color: #27564b; background: #e8f3ef; font-size: 10px; }
 .path-chip svg { width: 13px; height: 13px; }
 .path-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 17px; }
-.select-wrap { position: relative; }
-.select-wrap select { width: 100%; height: 43px; appearance: none; padding: 0 38px 0 13px; border: 1px solid #d7dfdc; border-radius: 9px; outline: none; color: var(--ink); background: white; font-size: 12px; }
-.select-wrap select:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(19,124,104,.1); }
-.select-wrap svg { position: absolute; right: 12px; top: 13px; width: 16px; height: 16px; color: #8e9996; pointer-events: none; }
-.plain-input, textarea { width: 100%; border: 1px solid #d7dfdc; border-radius: 9px; outline: none; color: var(--ink); background: white; font-size: 12px; transition: border-color .2s, box-shadow .2s; }
-.plain-input { height: 43px; padding: 0 13px; }
+textarea { width: 100%; border: 1px solid #d7dfdc; border-radius: 9px; outline: none; color: var(--ink); background: white; font-size: 12px; transition: border-color .2s, box-shadow .2s; }
 textarea { min-height: 78px; padding: 12px 13px; resize: vertical; line-height: 1.5; }
-.plain-input:focus, textarea:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(19,124,104,.1); }
+textarea:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(19,124,104,.1); }
 .form-footer { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding-top: 1px; }
 .form-footer-note { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 10px; }
 .form-footer-note svg { width: 15px; height: 15px; color: var(--green); }
@@ -262,7 +262,6 @@ textarea { min-height: 78px; padding: 12px 13px; resize: vertical; line-height: 
   .job-layout { display: flex; flex-direction: column-reverse; }
   .build-form-panel, .build-sidebar { width: 100%; }
   .build-sidebar { position: static; min-height: 450px; height: 540px; }
-  .form-grid { grid-template-columns: 1fr; }
   .form-footer { align-items: stretch; flex-direction: column; }
   .build-submit { width: 100%; }
   .login-panel { padding: 28px; }
