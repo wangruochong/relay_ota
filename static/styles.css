@@ -114,7 +114,7 @@ svg { fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round
 .status-orb.queued { border-color: #9fb3d6; color: var(--blue); background: var(--blue-soft); }
 @keyframes spin { to { transform: rotate(360deg); } }
 .job-name { display: flex; align-items: center; gap: 15px; }
-.job-monogram { width: 43px; height: 43px; display: grid; place-items: center; border-radius: 11px; color: #234c43; background: #e7f1ed; font-family: Georgia, serif; font-size: 15px; font-weight: 700; }
+.job-icon { width: 43px; height: 43px; flex: 0 0 auto; display: block; border-radius: 11px; object-fit: cover; box-shadow: 0 3px 10px rgba(25,48,43,.12); }
 .job-name b { display: block; margin-bottom: 6px; font-size: 15px; }
 .job-name small { color: var(--muted); font-size: 11px; }
 .build-cell b { display: block; margin-bottom: 6px; font-size: 13px; font-variant-numeric: tabular-nums; }
@@ -131,7 +131,7 @@ svg { fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round
 .job-page { width: min(1500px, 94vw); }
 .job-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 28px; }
 .job-title { display: flex; align-items: center; gap: 15px; }
-.job-title .job-monogram { width: 48px; height: 48px; font-size: 17px; }
+.job-title .job-icon { width: 52px; height: 52px; border-radius: 12px; }
 .job-title h1 { margin: 0 0 6px; font-family: Georgia, "Songti SC", serif; font-size: 29px; font-weight: 600; }
 .job-title p { margin: 0; color: var(--muted); font-size: 12px; }
 .job-layout { display: grid; grid-template-columns: 330px minmax(0, 1fr); gap: 24px; align-items: start; }
@@ -149,6 +149,12 @@ svg { fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round
 .date-separator { padding: 12px 10px 7px; color: #9aa4a1; font-size: 9px; font-weight: 700; letter-spacing: .12em; }
 .build-item { width: 100%; display: grid; grid-template-columns: 28px 1fr auto; align-items: center; gap: 8px; min-height: 54px; padding: 7px 10px; border: 0; border-radius: 10px; background: transparent; text-align: left; cursor: pointer; }
 .build-item:hover { background: var(--surface-soft); }
+.build-item-new { animation: build-item-arrival 1.8s ease-out; }
+@keyframes build-item-arrival {
+  0% { background: #ccefe4; box-shadow: inset 3px 0 var(--green), 0 0 0 1px rgba(19,124,104,.16); transform: translateX(-5px); }
+  25% { background: #e3f6ef; transform: translateX(0); }
+  100% { background: transparent; box-shadow: none; }
+}
 .build-item .status-orb { width: 24px; height: 24px; }
 .build-item .status-orb svg { width: 12px; height: 12px; }
 .build-primary { display: flex; align-items: center; gap: 7px; margin-bottom: 4px; }
@@ -223,6 +229,7 @@ textarea:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(19,124,1
 .detail-row:last-child { border-bottom: 0; }
 .detail-row dt { color: var(--muted); }
 .detail-row dd { min-width: 0; margin: 0; color: #33413e; word-break: break-word; }
+.detail-row.failure-reason dd { color: var(--red); font-weight: 700; }
 .detail-paths { display: flex; flex-direction: column; gap: 6px; }
 .detail-path { padding: 7px 9px; border-radius: 7px; color: #315b52; background: var(--green-soft); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 9px; }
 .log-box { height: 520px; max-height: 520px; overflow: auto; margin: 0; padding: 14px; border-radius: 10px; color: #bcd1cc; background: #152724; font: 10px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-all; user-select: text; -webkit-user-select: text; cursor: text; }
@@ -256,7 +263,7 @@ textarea:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(19,124,1
   .job-row { grid-template-columns: 44px minmax(0, 1fr) 24px; min-height: 84px; padding: 0 14px; }
   .job-row > .build-cell, .job-row > .status-badge { display: none; }
   .job-name { gap: 10px; }
-  .job-monogram { width: 38px; height: 38px; }
+  .job-icon { width: 38px; height: 38px; border-radius: 10px; }
   .breadcrumbs { margin-bottom: 23px; }
   .job-header { align-items: flex-start; }
   .job-layout { display: flex; flex-direction: column-reverse; }

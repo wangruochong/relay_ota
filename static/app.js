@@ -14,6 +14,8 @@ const state = {
   suppressPathFocus: false,
   pollTimer: null,
   buildFilter: "",
+  highlightedBuildId: null,
+  highlightedBuildTimer: null,
 };
 
 const icons = {
@@ -130,6 +132,10 @@ function duration(value) {
   return `${Math.floor(value / 60)} 分 ${Math.round(value % 60)} 秒`;
 }
 
+function jobIconHTML(job) {
+  return `<img class="job-icon" src="/res/${encodeURIComponent(job.id)}_icon.png" alt="${escapeHTML(job.display_name)} 图标" />`;
+}
+
 async function renderJobs() {
   const root = document.querySelector("#page-root");
   state.currentJob = null;
@@ -151,7 +157,7 @@ function renderJobsPayload(payload) {
     const status = last?.status || "success";
     return `<article class="job-row" data-job-id="${escapeHTML(job.id)}" tabindex="0" role="button">
       <div>${statusHTML(status, true)}</div>
-      <div class="job-name"><span class="job-monogram">${escapeHTML(job.display_name.slice(0, 3))}</span><div><b>${escapeHTML(job.display_name)}</b><small>${escapeHTML(job.description)}</small></div></div>
+      <div class="job-name">${jobIconHTML(job)}<div><b>${escapeHTML(job.display_name)}</b><small>${escapeHTML(job.description)}</small></div></div>
       <div class="build-cell"><b>${last ? `#${last.build_number}` : "尚无构建"}</b><small>${last ? relativeTime(last.created_at) : "点击进入创建第一个任务"}</small></div>
       <span class="status-badge ${escapeHTML(status)}">${last ? statusMap[status].label : "准备就绪"}</span>
       <span class="job-open">${icons.chevron}</span>
@@ -196,7 +202,7 @@ async function renderJob(jobId) {
     state.buildFilter = "";
     root.innerHTML = `<main class="page job-page">
       ${breadcrumbs(state.currentJob)}
-      <div class="job-header"><div class="job-title"><span class="job-monogram">${escapeHTML(state.currentJob.display_name.slice(0, 3))}</span><div><h1>${escapeHTML(state.currentJob.display_name)}</h1><p>${escapeHTML(state.currentJob.description)} · 根目录 ${escapeHTML(state.currentJob.resource_root_name)}</p></div></div><span class="server-state"><i></i> 可构建</span></div>
+      <div class="job-header"><div class="job-title">${jobIconHTML(state.currentJob)}<div><h1>${escapeHTML(state.currentJob.display_name)}</h1><p>${escapeHTML(state.currentJob.description)} · 根目录 ${escapeHTML(state.currentJob.resource_root_name)}</p></div></div><span class="server-state"><i></i> 可构建</span></div>
       <div class="job-layout">
         <aside class="panel build-sidebar"><div class="panel-header"><h2>构建记录</h2><span id="build-count" class="build-count">${state.builds.length}</span></div><label class="build-filter"><span class="input-wrap"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="build-filter" placeholder="筛选编号或构建者" /></span></label><div id="build-list" class="build-list"></div></aside>
         <section class="panel build-form-panel"><div class="form-heading"><p class="eyebrow">NEW BUILD</p><h2>创建资源更新任务</h2><p>确认资源范围后提交构建</p></div>${buildFormHTML()}</section>
@@ -273,7 +279,8 @@ function closePathSuggestions() {
 
 function buildListItem(build) {
   const status = statusMap[build.status] || statusMap.queued;
-  return `<button class="build-item" data-build-id="${build.id}">${statusHTML(build.status, true)}<span><span class="build-primary"><b>#${build.build_number}</b><span class="status-badge ${build.status}">${status.label}</span></span><span class="build-meta"><span>${escapeHTML(build.username)}</span><span>${relativeTime(build.created_at)}</span></span></span><span class="build-arrow">${icons.chevron}</span></button>`;
+  const highlighted = state.highlightedBuildId === build.id ? " build-item-new" : "";
+  return `<button class="build-item${highlighted}" data-build-id="${build.id}">${statusHTML(build.status, true)}<span><span class="build-primary"><b>#${build.build_number}</b><span class="status-badge ${build.status}">${status.label}</span></span><span class="build-meta"><span>${escapeHTML(build.username)}</span><span>${relativeTime(build.created_at)}</span></span></span><span class="build-arrow">${icons.chevron}</span></button>`;
 }
 
 function renderBuildList() {
@@ -285,6 +292,17 @@ function renderBuildList() {
   root.innerHTML = builds.length ? `<div class="date-separator">最近构建</div>${builds.map(buildListItem).join("")}` : '<div class="empty-state">暂无匹配的构建记录</div>';
 }
 
+function highlightNewBuild(buildId) {
+  clearTimeout(state.highlightedBuildTimer);
+  state.highlightedBuildId = buildId;
+  renderBuildList();
+  state.highlightedBuildTimer = window.setTimeout(() => {
+    if (state.highlightedBuildId !== buildId) return;
+    state.highlightedBuildId = null;
+    document.querySelector(`.build-item[data-build-id="${buildId}"]`)?.classList.remove("build-item-new");
+  }, 1800);
+}
+
 function drawerHasTextSelection(drawer) {
   const selection = window.getSelection();
   if (!selection || selection.isCollapsed) return false;
@@ -292,6 +310,18 @@ function drawerHasTextSelection(drawer) {
     (selection.anchorNode && drawer.contains(selection.anchorNode)) ||
     (selection.focusNode && drawer.contains(selection.focusNode))
   );
+}
+
+function resetBuildForm() {
+  Object.values(state.searchTimers).forEach(timer => clearTimeout(timer));
+  state.pathSlots = [""];
+  state.pathSelections = [false];
+  state.suggestions = {};
+  state.activeSuggestion = null;
+  state.searchTimers = {};
+  state.searchVersions = {};
+  document.querySelector("#build-form")?.reset();
+  renderPathRows();
 }
 
 function startPolling() {
@@ -340,10 +370,9 @@ async function submitBuild(event) {
       }),
     });
     state.builds.unshift(payload.build);
-    renderBuildList();
-    document.querySelector("#note").value = "";
+    highlightNewBuild(payload.build.id);
+    resetBuildForm();
     toast(`构建 #${payload.build.build_number} 已创建，正在后台执行`);
-    navigate("/");
   } catch (error) {
     const failedBuild = error.payload?.build;
     if (failedBuild && !state.builds.some(build => build.id === failedBuild.id)) {
@@ -379,7 +408,7 @@ async function renderDrawer(build, loadLog) {
   const status = statusMap[build.status] || statusMap.queued;
   drawer.innerHTML = `<div class="drawer-top"><div><p>BUILD DETAILS</p><h2>#${build.build_number} 构建详情</h2></div><button class="icon-button drawer-close" aria-label="关闭">${icons.failed}</button></div>
     <div class="drawer-status">${statusHTML(build.status, true)}<div><h3>${status.label}</h3><p>${build.status === "running" ? "打包机正在处理当前任务" : build.status === "queued" ? "任务正在等待空闲构建槽" : `耗时 ${duration(build.duration_seconds)}`}</p></div></div>
-    <section class="detail-section"><h3>基础信息</h3><dl class="detail-grid"><div class="detail-row"><dt>构建项目</dt><dd>${escapeHTML(build.job_id.toUpperCase())}</dd></div><div class="detail-row"><dt>构建者</dt><dd>${escapeHTML(build.username)}</dd></div><div class="detail-row"><dt>提交时间</dt><dd>${formatDate(build.created_at)}</dd></div><div class="detail-row"><dt>开始时间</dt><dd>${formatDate(build.started_at)}</dd></div><div class="detail-row"><dt>完成时间</dt><dd>${formatDate(build.finished_at)}</dd></div>${build.error_message ? `<div class="detail-row"><dt>失败原因</dt><dd>${escapeHTML(build.error_message)}</dd></div>` : ""}<div class="detail-row"><dt>OTA 版本号</dt><dd>${escapeHTML(build.parameters.jenkins_build_number ?? "—")}</dd></div></dl></section>
+    <section class="detail-section"><h3>基础信息</h3><dl class="detail-grid"><div class="detail-row"><dt>构建项目</dt><dd>${escapeHTML(build.job_id.toUpperCase())}</dd></div><div class="detail-row"><dt>构建者</dt><dd>${escapeHTML(build.username)}</dd></div><div class="detail-row"><dt>提交时间</dt><dd>${formatDate(build.created_at)}</dd></div><div class="detail-row"><dt>开始时间</dt><dd>${formatDate(build.started_at)}</dd></div><div class="detail-row"><dt>完成时间</dt><dd>${formatDate(build.finished_at)}</dd></div>${build.error_message ? `<div class="detail-row failure-reason"><dt>失败原因</dt><dd>${escapeHTML(build.error_message)}</dd></div>` : ""}<div class="detail-row"><dt>OTA 版本号</dt><dd>${escapeHTML(build.parameters.jenkins_build_number ?? "—")}</dd></div></dl></section>
     <section class="detail-section"><h3>构建参数</h3><dl class="detail-grid"><div class="detail-row"><dt>资源路径</dt><dd><span class="detail-paths">${(build.parameters.resource_paths || []).map(path => `<span class="detail-path">${escapeHTML(path)}</span>`).join("")}</span></dd></div><div class="detail-row"><dt>构建说明</dt><dd>${escapeHTML(build.parameters.note || "—")}</dd></div></dl></section>
     <section class="detail-section"><h3>构建日志</h3><pre id="build-log" class="log-box">${loadLog ? "正在加载日志…" : "日志随状态自动更新…"}</pre></section>`;
   if (loadLog || ["success", "failed"].includes(build.status)) {

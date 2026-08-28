@@ -37,6 +37,7 @@ from urllib.request import (
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
+RES_DIR = BASE_DIR / "res"
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "ota_tool.db"
 LOG_DIR = DATA_DIR / "logs"
@@ -1074,15 +1075,17 @@ class AppHandler(BaseHTTPRequestHandler):
     def _serve_static(self, request_path: str) -> None:
         if request_path == "/":
             request_path = "/index.html"
-        relative = request_path.lstrip("/")
-        candidate = (STATIC_DIR / relative).resolve()
+        is_resource = request_path.startswith("/res/")
+        asset_root = RES_DIR if is_resource else STATIC_DIR
+        relative = request_path[len("/res/"):] if is_resource else request_path.lstrip("/")
+        candidate = (asset_root / relative).resolve()
         try:
-            candidate.relative_to(STATIC_DIR.resolve())
+            candidate.relative_to(asset_root.resolve())
         except ValueError:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         # SPA 路由统一回退到 index.html。
-        if not candidate.is_file() and "." not in Path(relative).name:
+        if not is_resource and not candidate.is_file() and "." not in Path(relative).name:
             candidate = STATIC_DIR / "index.html"
         if not candidate.is_file():
             self.send_error(HTTPStatus.NOT_FOUND)
