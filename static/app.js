@@ -9,12 +9,14 @@ const state = {
   pathSelections: [false],
   suggestions: {},
   activeSuggestion: null,
+  suggestionCursor: null,
   searchTimers: {},
   searchVersions: {},
   suppressPathFocus: false,
   pollTimer: null,
   buildFilter: "",
   highlightedBuildId: null,
+  highlightedBuildPending: false,
   highlightedBuildTimer: null,
 };
 
@@ -199,6 +201,7 @@ async function renderJob(jobId) {
     state.suggestions = {};
     state.searchVersions = {};
     state.activeSuggestion = null;
+    state.suggestionCursor = null;
     state.buildFilter = "";
     root.innerHTML = `<main class="page job-page">
       ${breadcrumbs(state.currentJob)}
@@ -231,10 +234,16 @@ function renderPathRows() {
     const selected = Boolean(value && state.pathSelections[index]);
     const suggestions = state.suggestions[index] || [];
     const show = state.activeSuggestion === index && !selected;
+    const activeOption = show && state.suggestionCursor !== null
+      ? `path-suggestion-${index}-${state.suggestionCursor}`
+      : "";
     const list = suggestions.length
-      ? suggestions.map(path => `<button class="suggestion-item" type="button" role="option" data-select-path="${index}" data-path="${escapeHTML(path)}">${icons.folder}<span>${escapeHTML(path)}</span></button>`).join("")
+      ? suggestions.map((path, optionIndex) => {
+        const active = state.suggestionCursor === optionIndex;
+        return `<button id="path-suggestion-${index}-${optionIndex}" class="suggestion-item${active ? " is-active" : ""}" type="button" role="option" aria-selected="${active}" data-select-path="${index}" data-suggestion-index="${optionIndex}" data-path="${escapeHTML(path)}">${icons.folder}<span>${escapeHTML(path)}</span></button>`;
+      }).join("")
       : '<div class="suggestion-empty">未找到匹配目录</div>';
-    return `<div class="path-row"><span class="path-index">${String(index + 1).padStart(2, "0")}</span><div class="path-input-wrap${selected ? " is-selected" : ""}"><span class="input-wrap"><svg viewBox="0 0 24 24">${selected ? '<path d="m7 12 3.2 3.2L17 8.5"/>' : '<circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/>'}</svg><input class="path-input" role="combobox" aria-autocomplete="list" aria-expanded="${show}" data-path-index="${index}" value="${escapeHTML(value)}" placeholder="搜索资源目录，如 ResourcesCommon" autocomplete="off" ${selected ? "readonly" : ""} />${selected ? `<button class="clear-path-selection" data-clear-path="${index}" type="button" title="重新选择" aria-label="重新选择资源路径">${icons.failed}</button>` : ""}</span>${show ? `<div class="path-suggestions" role="listbox">${list}</div>` : ""}</div><button class="remove-path" data-remove-path="${index}" type="button" aria-label="删除路径" ${state.pathSlots.length === 1 ? "disabled" : ""}><svg viewBox="0 0 24 24"><path d="M5 12h14"/></svg></button></div>`;
+    return `<div class="path-row"><span class="path-index">${String(index + 1).padStart(2, "0")}</span><div class="path-input-wrap${selected ? " is-selected" : ""}"><span class="input-wrap"><svg viewBox="0 0 24 24">${selected ? '<path d="m7 12 3.2 3.2L17 8.5"/>' : '<circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/>'}</svg><input class="path-input" role="combobox" aria-autocomplete="list" aria-expanded="${show}" aria-controls="path-suggestions-${index}" ${activeOption ? `aria-activedescendant="${activeOption}"` : ""} data-path-index="${index}" value="${escapeHTML(value)}" placeholder="搜索资源目录，如 ResourcesCommon" autocomplete="off" ${selected ? "readonly" : ""} />${selected ? `<button class="clear-path-selection" data-clear-path="${index}" type="button" title="重新选择" aria-label="重新选择资源路径">${icons.failed}</button>` : ""}</span>${show ? `<div id="path-suggestions-${index}" class="path-suggestions" role="listbox">${list}</div>` : ""}</div><button class="remove-path" data-remove-path="${index}" type="button" aria-label="删除路径" ${state.pathSlots.length === 1 ? "disabled" : ""}><svg viewBox="0 0 24 24"><path d="M5 12h14"/></svg></button></div>`;
   }).join("");
   const selected = state.pathSlots.filter((value, index) => value && state.pathSelections[index]);
   document.querySelector("#selected-paths").innerHTML = selected.length ? `<div class="selected-paths"><span class="selected-label">已选择 ${selected.length} 个路径</span><div class="path-chips">${selected.map(path => `<span class="path-chip">${icons.folder}<span>${escapeHTML(path)}</span></span>`).join("")}</div></div>` : "";
@@ -244,6 +253,7 @@ function searchPath(index, query) {
   clearTimeout(state.searchTimers[index]);
   if (state.pathSelections[index]) return;
   state.activeSuggestion = index;
+  state.suggestionCursor = null;
   const requestVersion = (state.searchVersions[index] || 0) + 1;
   state.searchVersions[index] = requestVersion;
   state.searchTimers[index] = setTimeout(async () => {
@@ -251,6 +261,7 @@ function searchPath(index, query) {
       const result = await api(`/api/jobs/${encodeURIComponent(state.currentJob.id)}/paths?q=${encodeURIComponent(query)}`);
       if (state.searchVersions[index] !== requestVersion || state.activeSuggestion !== index) return;
       state.suggestions[index] = result.paths.filter(path => !state.pathSlots.some((value, slot) => slot !== index && state.pathSelections[slot] && value === path));
+      state.suggestionCursor = null;
       const restoreFocus = document.activeElement?.dataset.pathIndex === String(index);
       if (restoreFocus) state.suppressPathFocus = true;
       renderPathRows();
@@ -274,12 +285,46 @@ function closePathSuggestions() {
   }
   state.suggestions[index] = [];
   state.activeSuggestion = null;
+  state.suggestionCursor = null;
+  renderPathRows();
+}
+
+function updateSuggestionCursor(index, cursor) {
+  const suggestions = state.suggestions[index] || [];
+  if (!suggestions.length) return;
+  state.suggestionCursor = cursor;
+  const input = document.querySelector(`[data-path-index="${index}"]`);
+  const options = document.querySelectorAll(`[data-select-path="${index}"]`);
+  options.forEach((option, optionIndex) => {
+    const active = optionIndex === cursor;
+    option.classList.toggle("is-active", active);
+    option.setAttribute("aria-selected", String(active));
+  });
+  const activeOption = options[cursor];
+  if (input && activeOption) input.setAttribute("aria-activedescendant", activeOption.id);
+  const list = activeOption?.closest(".path-suggestions");
+  if (!list || !activeOption) return;
+  if (activeOption.offsetTop < list.scrollTop) list.scrollTop = activeOption.offsetTop;
+  const optionBottom = activeOption.offsetTop + activeOption.offsetHeight;
+  if (optionBottom > list.scrollTop + list.clientHeight) {
+    list.scrollTop = optionBottom - list.clientHeight;
+  }
+}
+
+function selectPathSuggestion(index, path) {
+  if (!path) return;
+  clearTimeout(state.searchTimers[index]);
+  state.searchVersions[index] = (state.searchVersions[index] || 0) + 1;
+  state.pathSlots[index] = path;
+  state.pathSelections[index] = true;
+  state.activeSuggestion = null;
+  state.suggestionCursor = null;
   renderPathRows();
 }
 
 function buildListItem(build) {
   const status = statusMap[build.status] || statusMap.queued;
-  const highlighted = state.highlightedBuildId === build.id ? " build-item-new" : "";
+  const highlighted = state.highlightedBuildPending && state.highlightedBuildId === build.id ? " build-item-new" : "";
   return `<button class="build-item${highlighted}" data-build-id="${build.id}">${statusHTML(build.status, true)}<span><span class="build-primary"><b>#${build.build_number}</b><span class="status-badge ${build.status}">${status.label}</span></span><span class="build-meta"><span>${escapeHTML(build.username)}</span><span>${relativeTime(build.created_at)}</span></span></span><span class="build-arrow">${icons.chevron}</span></button>`;
 }
 
@@ -290,17 +335,32 @@ function renderBuildList() {
   const builds = state.builds.filter(build => `#${build.build_number} ${build.username}`.toLowerCase().includes(needle));
   document.querySelector("#build-count").textContent = state.builds.length;
   root.innerHTML = builds.length ? `<div class="date-separator">最近构建</div>${builds.map(buildListItem).join("")}` : '<div class="empty-state">暂无匹配的构建记录</div>';
+  if (state.highlightedBuildPending && root.querySelector(`[data-build-id="${state.highlightedBuildId}"]`)) {
+    state.highlightedBuildPending = false;
+  }
+}
+
+function buildListSignature(builds) {
+  return builds.map(build => [
+    build.id,
+    build.build_number,
+    build.status,
+    build.username,
+    build.created_at,
+  ].join(":")).join("|");
 }
 
 function highlightNewBuild(buildId) {
   clearTimeout(state.highlightedBuildTimer);
   state.highlightedBuildId = buildId;
+  state.highlightedBuildPending = true;
   renderBuildList();
   state.highlightedBuildTimer = window.setTimeout(() => {
     if (state.highlightedBuildId !== buildId) return;
     state.highlightedBuildId = null;
+    state.highlightedBuildPending = false;
     document.querySelector(`.build-item[data-build-id="${buildId}"]`)?.classList.remove("build-item-new");
-  }, 1800);
+  }, 1900);
 }
 
 function drawerHasTextSelection(drawer) {
@@ -318,6 +378,7 @@ function resetBuildForm() {
   state.pathSelections = [false];
   state.suggestions = {};
   state.activeSuggestion = null;
+  state.suggestionCursor = null;
   state.searchTimers = {};
   state.searchVersions = {};
   document.querySelector("#build-form")?.reset();
@@ -330,8 +391,9 @@ function startPolling() {
     if (!state.currentJob || document.hidden) return;
     try {
       const payload = await api(`/api/jobs/${encodeURIComponent(state.currentJob.id)}/builds`);
+      const listChanged = buildListSignature(state.builds) !== buildListSignature(payload.builds);
       state.builds = payload.builds;
-      renderBuildList();
+      if (listChanged || state.highlightedBuildId === null) renderBuildList();
       const drawer = document.querySelector("#build-drawer");
       const selectedId = Number(drawer.dataset.buildId);
       const selected = state.builds.find(build => build.id === selectedId);
@@ -470,16 +532,12 @@ document.addEventListener("click", event => {
   if (remove && state.pathSlots.length > 1) {
     state.pathSlots.splice(Number(remove.dataset.removePath), 1);
     state.pathSelections.splice(Number(remove.dataset.removePath), 1);
-    state.suggestions = {}; state.searchVersions = {}; state.activeSuggestion = null; renderPathRows();
+    state.suggestions = {}; state.searchVersions = {}; state.activeSuggestion = null; state.suggestionCursor = null; renderPathRows();
   }
   const suggestion = event.target.closest("[data-select-path]");
   if (suggestion) {
     const index = Number(suggestion.dataset.selectPath);
-    clearTimeout(state.searchTimers[index]);
-    state.searchVersions[index] = (state.searchVersions[index] || 0) + 1;
-    state.pathSlots[index] = suggestion.dataset.path;
-    state.pathSelections[index] = true;
-    state.activeSuggestion = null; renderPathRows();
+    selectPathSuggestion(index, suggestion.dataset.path);
   }
   const clearSelection = event.target.closest("[data-clear-path]");
   if (clearSelection) {
@@ -490,6 +548,7 @@ document.addEventListener("click", event => {
     state.pathSelections[index] = false;
     state.suggestions[index] = [];
     state.activeSuggestion = null;
+    state.suggestionCursor = null;
     renderPathRows();
     document.querySelector(`[data-path-index="${index}"]`)?.focus();
   }
@@ -519,6 +578,28 @@ document.addEventListener("focusout", event => {
 });
 
 document.addEventListener("keydown", event => {
+  const pathInput = event.target.closest?.(".path-input");
+  if (pathInput && !event.isComposing) {
+    const index = Number(pathInput.dataset.pathIndex);
+    const suggestions = state.suggestions[index] || [];
+    if ((event.key === "ArrowDown" || event.key === "ArrowUp") && state.activeSuggestion === index) {
+      event.preventDefault();
+      if (suggestions.length) {
+        const direction = event.key === "ArrowDown" ? 1 : -1;
+        const current = state.suggestionCursor;
+        const cursor = current === null
+          ? (direction > 0 ? 0 : suggestions.length - 1)
+          : (current + direction + suggestions.length) % suggestions.length;
+        updateSuggestionCursor(index, cursor);
+      }
+      return;
+    }
+    if (event.key === "Enter" && state.activeSuggestion === index && state.suggestionCursor !== null) {
+      event.preventDefault();
+      selectPathSuggestion(index, suggestions[state.suggestionCursor]);
+      return;
+    }
+  }
   if (event.key === "Escape" && state.activeSuggestion !== null) {
     event.preventDefault();
     closePathSuggestions();

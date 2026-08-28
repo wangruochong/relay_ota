@@ -53,11 +53,12 @@ TP1 与 TP4 使用同一份 `TP_CLIENT_ROOT` 工作区，但分别切换到：
 
 每次构建会串行执行：
 
-1. `git reset --hard`、`git clean -fd`，切换对应主分支并拉取最新代码。
-2. 执行 `coffee compile.coffee res`，每条资源路径使用一个 `-d <path>` 参数。
-3. 执行 `git add -A` 并推送对应主分支；构建说明非空时提交信息为 `res:{构建说明}`，否则为 `res`。
-4. 读取 Jenkins 参数定义，将 `branch` 固定为 `beta`、`alert` 固定为 `true`，其余布尔参数设为 `false`、其余参数设为空，然后调用 `buildWithParameters`。
-5. 轮询 Jenkins 队列和实际构建（自动修正 Jenkins 返回的 localhost 地址，并对临时查询失败进行重试），保存 OTA 版本号，直到获得最终结果并更新本地记录和日志。
+1. 自动清理未被进程占用的过期 `index.lock`，执行 `git reset --hard`、`git clean -fd`，递归清理现有子模块修改，然后切换对应主分支并拉取最新代码。
+2. 执行 `git submodule sync --recursive` 和 `git submodule update --init --recursive --force`，再递归清理子模块中的本地修改与未跟踪文件。
+3. 执行 `coffee compile.coffee res`，每条资源路径使用一个 `-d <path>` 参数；服务端会为旧版脚本补充非 TTY 输出兼容方法。
+4. 执行 `git add -A` 并推送对应主分支；构建说明非空时提交信息为 `res:{构建说明}`，否则为 `res`。
+5. 读取 Jenkins 参数定义，将 `branch` 固定为 `beta`、`alert` 固定为 `true`，其余布尔参数设为 `false`、其余参数设为空，然后调用 `buildWithParameters`。
+6. 轮询 Jenkins 队列和实际构建（自动修正 Jenkins 返回的 localhost 地址，并对临时查询失败进行重试），保存 OTA 版本号，直到获得最终结果并更新本地记录和日志。
 
 点击开始构建时会先生成“构建中”记录并返回项目列表；由于 TP1/TP4 共用工作区，后续并发请求显示为“等待中”，由单线程构建池依次处理。命令输出会合并保存到对应构建日志，任一步骤失败都会停止后续操作，并把记录更新为失败状态。
 

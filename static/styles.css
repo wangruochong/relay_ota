@@ -195,7 +195,7 @@ svg { fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round
 .remove-path svg { width: 15px; height: 15px; }
 .path-suggestions { position: absolute; z-index: 15; top: calc(100% + 6px); left: 0; right: 0; overflow-y: auto; max-height: 245px; padding: 6px; border: 1px solid var(--line); border-radius: 11px; background: white; box-shadow: var(--shadow); }
 .suggestion-item { width: 100%; display: flex; align-items: center; gap: 9px; padding: 9px 10px; border: 0; border-radius: 7px; background: white; color: #3b4946; text-align: left; font-size: 11px; cursor: pointer; }
-.suggestion-item:hover { color: var(--green); background: var(--green-soft); }
+.suggestion-item:hover, .suggestion-item.is-active { color: var(--green); background: var(--green-soft); }
 .suggestion-item svg { flex: 0 0 auto; width: 15px; height: 15px; color: #86928f; }
 .suggestion-empty { padding: 16px; color: var(--muted); text-align: center; font-size: 11px; }
 .selected-paths { margin: 16px 0 0 34px; padding: 13px 14px; border: 1px dashed #cddbd7; border-radius: 10px; background: #fafcfb; }

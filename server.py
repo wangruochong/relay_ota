@@ -51,6 +51,9 @@ JENKINS_TIMEOUT_SECONDS = 30
 JENKINS_POLL_INTERVAL_SECONDS = 3
 JENKINS_BUILD_TIMEOUT_SECONDS = 6 * 60 * 60
 JENKINS_STATUS_RETRY_ATTEMPTS = 3
+GIT_STALE_INDEX_LOCK_SECONDS = 10 * 60
+GIT_ABANDONED_INDEX_LOCK_SECONDS = 24 * 60 * 60
+NODE_STDOUT_COMPAT_PATH = BASE_DIR / "node_stdout_compat.js"
 
 
 def utc_now() -> str:
@@ -359,6 +362,77 @@ def run_command(
         raise PipelineError(f"{step}失败（退出码 {result.returncode}）{suffix}")
 
 
+def _git_lock_in_use(lock_path: Path) -> Optional[bool]:
+    """通过 lsof 判断锁文件是否仍被进程持有；无法判断时返回 None。"""
+    try:
+        result = subprocess.run(
+            ["lsof", "-t", "--", str(lock_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=5,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    return None
+
+
+def clear_stale_git_index_locks(project_root: Path, log: TextIO) -> None:
+    """清理主仓库和递归子模块中已确认过期的 index.lock。"""
+    git_dir = project_root / ".git"
+    lock_paths = [git_dir / "index.lock"]
+    if git_dir.is_dir():
+        lock_paths.extend(git_dir.glob("modules/**/index.lock"))
+
+    now = time.time()
+    for lock_path in sorted(set(lock_paths)):
+        try:
+            lock_stat = lock_path.stat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise PipelineError(f"检查 Git 锁文件失败：{lock_path}：{exc}") from exc
+
+        age_seconds = max(0.0, now - lock_stat.st_mtime)
+        if age_seconds < GIT_STALE_INDEX_LOCK_SECONDS:
+            log.write(
+                f"[Git] 保留最近创建的锁文件：{lock_path}"
+                f"（{round(age_seconds)} 秒）\n"
+            )
+            continue
+
+        in_use = _git_lock_in_use(lock_path)
+        if in_use is True:
+            log.write(f"[Git] 锁文件仍被进程使用，暂不清理：{lock_path}\n")
+            continue
+        if in_use is None and age_seconds < GIT_ABANDONED_INDEX_LOCK_SECONDS:
+            log.write(f"[Git] 无法确认锁文件是否仍在使用，暂不清理：{lock_path}\n")
+            continue
+
+        try:
+            current_stat = lock_path.stat()
+            if (
+                current_stat.st_ino != lock_stat.st_ino
+                or current_stat.st_mtime_ns != lock_stat.st_mtime_ns
+            ):
+                log.write(f"[Git] 锁文件已发生变化，暂不清理：{lock_path}\n")
+                continue
+            lock_path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise PipelineError(f"清理过期 Git 锁文件失败：{lock_path}：{exc}") from exc
+        log.write(
+            f"[Git] 已自动清理过期锁文件：{lock_path}"
+            f"（{round(age_seconds)} 秒）\n"
+        )
+    log.flush()
+
+
 def _jenkins_headers() -> Dict[str, str]:
     user = os.environ.get("JENKINS_USER", "").strip()
     api_token = os.environ.get("JENKINS_API_TOKEN", "").strip()
@@ -600,16 +674,27 @@ def execute_build_pipeline(
 
     command_env = os.environ.copy()
     command_env["GIT_TERMINAL_PROMPT"] = "0"
+    clear_stale_git_index_locks(project_root, log)
     run_command(["git", "reset", "--hard"], project_root, log, "清理本地修改", GIT_TIMEOUT_SECONDS, command_env)
     run_command(["git", "clean", "-fd"], project_root, log, "清理未跟踪文件", GIT_TIMEOUT_SECONDS, command_env)
+    run_command(["git", "submodule", "foreach", "--recursive", "git reset --hard"], project_root, log, "清理子模块本地修改", GIT_TIMEOUT_SECONDS, command_env)
+    run_command(["git", "submodule", "foreach", "--recursive", "git clean -fd"], project_root, log, "清理子模块未跟踪文件", GIT_TIMEOUT_SECONDS, command_env)
     run_command(["git", "fetch", "origin", branch], project_root, log, "拉取远端分支", GIT_TIMEOUT_SECONDS, command_env)
     run_command(["git", "checkout", "-B", branch, f"origin/{branch}"], project_root, log, "切换主分支", GIT_TIMEOUT_SECONDS, command_env)
     run_command(["git", "pull", "--ff-only", "origin", branch], project_root, log, "更新主分支", GIT_TIMEOUT_SECONDS, command_env)
+    run_command(["git", "submodule", "sync", "--recursive"], project_root, log, "同步子模块配置", GIT_TIMEOUT_SECONDS, command_env)
+    run_command(["git", "submodule", "update", "--init", "--recursive", "--force"], project_root, log, "更新子模块", GIT_TIMEOUT_SECONDS, command_env)
+    run_command(["git", "submodule", "foreach", "--recursive", "git reset --hard"], project_root, log, "确认子模块无本地修改", GIT_TIMEOUT_SECONDS, command_env)
+    run_command(["git", "submodule", "foreach", "--recursive", "git clean -fd"], project_root, log, "确认子模块无未跟踪文件", GIT_TIMEOUT_SECONDS, command_env)
 
     compile_command = ["coffee", "compile.coffee", "res"]
     for resource_path in resource_paths:
         compile_command.extend(["-d", resource_path])
-    run_command(compile_command, project_root, log, "资源编译", COMPILE_TIMEOUT_SECONDS, command_env)
+    compile_env = command_env.copy()
+    node_options = compile_env.get("NODE_OPTIONS", "").strip()
+    compat_option = f"--require={NODE_STDOUT_COMPAT_PATH}"
+    compile_env["NODE_OPTIONS"] = " ".join(filter(None, (node_options, compat_option)))
+    run_command(compile_command, project_root, log, "资源编译", COMPILE_TIMEOUT_SECONDS, compile_env)
 
     run_command(["git", "add", "-A"], project_root, log, "暂存资源修改", GIT_TIMEOUT_SECONDS, command_env)
     commit_message = f"res:{note}" if note else "res"
