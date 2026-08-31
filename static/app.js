@@ -5,13 +5,13 @@ const state = {
   jobs: [],
   currentJob: null,
   builds: [],
-  pathSlots: [""],
-  pathSelections: [false],
-  suggestions: {},
-  activeSuggestion: null,
+  selectedPaths: [],
+  pathQuery: "",
+  suggestions: [],
+  suggestionsOpen: false,
   suggestionCursor: null,
-  searchTimers: {},
-  searchVersions: {},
+  searchTimer: null,
+  searchVersion: 0,
   suppressPathFocus: false,
   pollTimer: null,
   buildFilter: "",
@@ -196,11 +196,11 @@ async function renderJob(jobId) {
     ]);
     state.currentJob = jobPayload.job;
     state.builds = buildsPayload.builds;
-    state.pathSlots = [""];
-    state.pathSelections = [false];
-    state.suggestions = {};
-    state.searchVersions = {};
-    state.activeSuggestion = null;
+    state.selectedPaths = [];
+    state.pathQuery = "";
+    state.suggestions = [];
+    state.searchVersion = 0;
+    state.suggestionsOpen = false;
     state.suggestionCursor = null;
     state.buildFilter = "";
     root.innerHTML = `<main class="page job-page">
@@ -221,7 +221,7 @@ async function renderJob(jobId) {
 
 function buildFormHTML() {
   return `<form id="build-form" class="build-form">
-    <section class="form-section"><div class="section-heading"><div><h3>资源更新路径 <span class="subtle">*</span></h3><p>输入关键词检索目录，支持同时更新多个路径</p></div><button id="add-path" class="add-path-button" type="button"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>添加路径</button></div><div id="path-rows"></div><div id="selected-paths"></div></section>
+    <section class="form-section"><div class="section-heading"><div><h3>资源更新路径 <span class="subtle">*</span></h3><p>输入关键词检索目录，支持同时更新多个路径</p></div></div><div id="path-rows"></div><div id="selected-paths"></div></section>
     <section class="form-section"><label><span class="field-label">构建说明</span><textarea id="note" maxlength="500" placeholder="简要说明本次更新内容，方便团队成员追溯（可选）"></textarea></label></section>
     <div class="form-footer"><span class="form-footer-note"><svg viewBox="0 0 24 24"><path d="M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20Z"/><path d="M12 16v-4M12 8h.01"/></svg>将更新资源、提交代码并触发 Jenkins OTA</span><button id="build-submit" class="button primary build-submit" type="submit">开始构建 <span>→</span></button></div>
   </form>`;
@@ -230,42 +230,40 @@ function buildFormHTML() {
 function renderPathRows() {
   const root = document.querySelector("#path-rows");
   if (!root) return;
-  root.innerHTML = state.pathSlots.map((value, index) => {
-    const selected = Boolean(value && state.pathSelections[index]);
-    const suggestions = state.suggestions[index] || [];
-    const show = state.activeSuggestion === index && !selected;
-    const activeOption = show && state.suggestionCursor !== null
-      ? `path-suggestion-${index}-${state.suggestionCursor}`
-      : "";
-    const list = suggestions.length
-      ? suggestions.map((path, optionIndex) => {
-        const active = state.suggestionCursor === optionIndex;
-        return `<button id="path-suggestion-${index}-${optionIndex}" class="suggestion-item${active ? " is-active" : ""}" type="button" role="option" aria-selected="${active}" data-select-path="${index}" data-suggestion-index="${optionIndex}" data-path="${escapeHTML(path)}">${icons.folder}<span>${escapeHTML(path)}</span></button>`;
-      }).join("")
-      : '<div class="suggestion-empty">未找到匹配目录</div>';
-    return `<div class="path-row"><span class="path-index">${String(index + 1).padStart(2, "0")}</span><div class="path-input-wrap${selected ? " is-selected" : ""}"><span class="input-wrap"><svg viewBox="0 0 24 24">${selected ? '<path d="m7 12 3.2 3.2L17 8.5"/>' : '<circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/>'}</svg><input class="path-input" role="combobox" aria-autocomplete="list" aria-expanded="${show}" aria-controls="path-suggestions-${index}" ${activeOption ? `aria-activedescendant="${activeOption}"` : ""} data-path-index="${index}" value="${escapeHTML(value)}" placeholder="搜索资源目录，如 ResourcesCommon" autocomplete="off" ${selected ? "readonly" : ""} />${selected ? `<button class="clear-path-selection" data-clear-path="${index}" type="button" title="重新选择" aria-label="重新选择资源路径">${icons.failed}</button>` : ""}</span>${show ? `<div id="path-suggestions-${index}" class="path-suggestions" role="listbox">${list}</div>` : ""}</div><button class="remove-path" data-remove-path="${index}" type="button" aria-label="删除路径" ${state.pathSlots.length === 1 ? "disabled" : ""}><svg viewBox="0 0 24 24"><path d="M5 12h14"/></svg></button></div>`;
-  }).join("");
-  const selected = state.pathSlots.filter((value, index) => value && state.pathSelections[index]);
-  document.querySelector("#selected-paths").innerHTML = selected.length ? `<div class="selected-paths"><span class="selected-label">已选择 ${selected.length} 个路径</span><div class="path-chips">${selected.map(path => `<span class="path-chip">${icons.folder}<span>${escapeHTML(path)}</span></span>`).join("")}</div></div>` : "";
+  const show = state.suggestionsOpen;
+  const activeOption = show && state.suggestionCursor !== null
+    ? `path-suggestion-${state.suggestionCursor}`
+    : "";
+  const list = state.suggestions.length
+    ? state.suggestions.map((path, optionIndex) => {
+      const active = state.suggestionCursor === optionIndex;
+      return `<button id="path-suggestion-${optionIndex}" class="suggestion-item${active ? " is-active" : ""}" type="button" role="option" aria-selected="${active}" data-select-path data-suggestion-index="${optionIndex}" data-path="${escapeHTML(path)}">${icons.folder}<span>${escapeHTML(path)}</span></button>`;
+    }).join("")
+    : '<div class="suggestion-empty">未找到匹配目录</div>';
+  root.innerHTML = `<div class="path-input-wrap"><span class="input-wrap"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input class="path-input" role="combobox" aria-autocomplete="list" aria-expanded="${show}" aria-controls="path-suggestions" ${activeOption ? `aria-activedescendant="${activeOption}"` : ""} value="${escapeHTML(state.pathQuery)}" placeholder="搜索资源目录，如 ResourcesCommon" autocomplete="off" /></span>${show ? `<div id="path-suggestions" class="path-suggestions" role="listbox">${list}</div>` : ""}</div>`;
+
+  const selectedRoot = document.querySelector("#selected-paths");
+  selectedRoot.innerHTML = state.selectedPaths.length
+    ? `<div class="selected-paths"><span class="selected-label">已选择 ${state.selectedPaths.length} 个路径</span><div class="path-chips">${state.selectedPaths.map((path, index) => `<span class="path-chip" title="${escapeHTML(path)}">${icons.folder}<span>${escapeHTML(path)}</span><button type="button" data-remove-selected-path="${index}" title="删除路径" aria-label="删除资源路径 ${escapeHTML(path)}">${icons.failed}</button></span>`).join("")}</div></div>`
+    : '<div class="selected-paths is-empty"><span class="selected-empty">尚未选择资源路径</span></div>';
 }
 
-function searchPath(index, query) {
-  clearTimeout(state.searchTimers[index]);
-  if (state.pathSelections[index]) return;
-  state.activeSuggestion = index;
+function searchPath(query) {
+  clearTimeout(state.searchTimer);
+  state.suggestionsOpen = true;
   state.suggestionCursor = null;
-  const requestVersion = (state.searchVersions[index] || 0) + 1;
-  state.searchVersions[index] = requestVersion;
-  state.searchTimers[index] = setTimeout(async () => {
+  const requestVersion = state.searchVersion + 1;
+  state.searchVersion = requestVersion;
+  state.searchTimer = setTimeout(async () => {
     try {
       const result = await api(`/api/jobs/${encodeURIComponent(state.currentJob.id)}/paths?q=${encodeURIComponent(query)}`);
-      if (state.searchVersions[index] !== requestVersion || state.activeSuggestion !== index) return;
-      state.suggestions[index] = result.paths.filter(path => !state.pathSlots.some((value, slot) => slot !== index && state.pathSelections[slot] && value === path));
+      if (state.searchVersion !== requestVersion || !state.suggestionsOpen) return;
+      state.suggestions = result.paths.filter(path => !state.selectedPaths.includes(path));
       state.suggestionCursor = null;
-      const restoreFocus = document.activeElement?.dataset.pathIndex === String(index);
+      const restoreFocus = document.activeElement?.matches(".path-input");
       if (restoreFocus) state.suppressPathFocus = true;
       renderPathRows();
-      const input = document.querySelector(`[data-path-index="${index}"]`);
+      const input = document.querySelector(".path-input");
       if (input && restoreFocus) {
         input.focus();
         input.setSelectionRange(input.value.length, input.value.length);
@@ -276,25 +274,21 @@ function searchPath(index, query) {
 }
 
 function closePathSuggestions() {
-  const index = state.activeSuggestion;
-  if (index === null) return;
-  clearTimeout(state.searchTimers[index]);
-  state.searchVersions[index] = (state.searchVersions[index] || 0) + 1;
-  if (!state.pathSelections[index] && state.pathSlots[index]) {
-    state.pathSlots[index] = "";
-  }
-  state.suggestions[index] = [];
-  state.activeSuggestion = null;
+  if (!state.suggestionsOpen) return;
+  clearTimeout(state.searchTimer);
+  state.searchVersion += 1;
+  state.pathQuery = "";
+  state.suggestions = [];
+  state.suggestionsOpen = false;
   state.suggestionCursor = null;
   renderPathRows();
 }
 
-function updateSuggestionCursor(index, cursor) {
-  const suggestions = state.suggestions[index] || [];
-  if (!suggestions.length) return;
+function updateSuggestionCursor(cursor) {
+  if (!state.suggestions.length) return;
   state.suggestionCursor = cursor;
-  const input = document.querySelector(`[data-path-index="${index}"]`);
-  const options = document.querySelectorAll(`[data-select-path="${index}"]`);
+  const input = document.querySelector(".path-input");
+  const options = document.querySelectorAll("[data-select-path]");
   options.forEach((option, optionIndex) => {
     const active = optionIndex === cursor;
     option.classList.toggle("is-active", active);
@@ -311,15 +305,23 @@ function updateSuggestionCursor(index, cursor) {
   }
 }
 
-function selectPathSuggestion(index, path) {
-  if (!path) return;
-  clearTimeout(state.searchTimers[index]);
-  state.searchVersions[index] = (state.searchVersions[index] || 0) + 1;
-  state.pathSlots[index] = path;
-  state.pathSelections[index] = true;
-  state.activeSuggestion = null;
+function selectPathSuggestion(path) {
+  if (!path || state.selectedPaths.includes(path)) return;
+  if (state.selectedPaths.length >= 20) {
+    toast("最多可添加 20 个资源路径", "error");
+    return;
+  }
+  clearTimeout(state.searchTimer);
+  state.searchVersion += 1;
+  state.selectedPaths.push(path);
+  state.pathQuery = "";
+  state.suggestions = [];
+  state.suggestionsOpen = false;
   state.suggestionCursor = null;
   renderPathRows();
+  state.suppressPathFocus = true;
+  document.querySelector(".path-input")?.focus();
+  state.suppressPathFocus = false;
 }
 
 function buildListItem(build) {
@@ -373,14 +375,14 @@ function drawerHasTextSelection(drawer) {
 }
 
 function resetBuildForm() {
-  Object.values(state.searchTimers).forEach(timer => clearTimeout(timer));
-  state.pathSlots = [""];
-  state.pathSelections = [false];
-  state.suggestions = {};
-  state.activeSuggestion = null;
+  clearTimeout(state.searchTimer);
+  state.selectedPaths = [];
+  state.pathQuery = "";
+  state.suggestions = [];
+  state.suggestionsOpen = false;
   state.suggestionCursor = null;
-  state.searchTimers = {};
-  state.searchVersions = {};
+  state.searchTimer = null;
+  state.searchVersion += 1;
   document.querySelector("#build-form")?.reset();
   renderPathRows();
 }
@@ -407,17 +409,16 @@ function startPolling() {
 
 async function submitBuild(event) {
   event.preventDefault();
-  const resourcePaths = state.pathSlots.filter((value, index) => value && state.pathSelections[index]);
+  const resourcePaths = [...state.selectedPaths];
   if (!resourcePaths.length) {
-    const hasInput = state.pathSlots.some(value => value.trim());
+    const hasInput = Boolean(state.pathQuery.trim());
     toast(hasInput ? "请从模糊匹配列表中选择资源更新路径" : "玩家资源更新路径为空", "error");
     document.querySelector(".path-input")?.focus();
     return;
   }
-  const unselectedIndex = state.pathSlots.findIndex((value, index) => value.trim() && !state.pathSelections[index]);
-  if (unselectedIndex >= 0) {
+  if (state.pathQuery.trim()) {
     toast("请从模糊匹配列表中选择资源更新路径", "error");
-    document.querySelector(`[data-path-index="${unselectedIndex}"]`)?.focus();
+    document.querySelector(".path-input")?.focus();
     return;
   }
   const button = document.querySelector("#build-submit");
@@ -523,43 +524,24 @@ document.addEventListener("click", event => {
   const buildItem = event.target.closest(".build-item[data-build-id]");
   if (buildItem) openBuildDrawer(Number(buildItem.dataset.buildId));
   if (event.target.closest("#drawer-backdrop") || event.target.closest(".drawer-close")) closeDrawer();
-  if (event.target.closest("#add-path")) {
-    if (state.pathSlots.length >= 20) return toast("最多可添加 20 个资源路径", "error");
-    state.pathSlots.push(""); state.pathSelections.push(false); renderPathRows();
-    document.querySelector(`[data-path-index="${state.pathSlots.length - 1}"]`)?.focus();
-  }
-  const remove = event.target.closest("[data-remove-path]");
-  if (remove && state.pathSlots.length > 1) {
-    state.pathSlots.splice(Number(remove.dataset.removePath), 1);
-    state.pathSelections.splice(Number(remove.dataset.removePath), 1);
-    state.suggestions = {}; state.searchVersions = {}; state.activeSuggestion = null; state.suggestionCursor = null; renderPathRows();
-  }
   const suggestion = event.target.closest("[data-select-path]");
   if (suggestion) {
-    const index = Number(suggestion.dataset.selectPath);
-    selectPathSuggestion(index, suggestion.dataset.path);
+    selectPathSuggestion(suggestion.dataset.path);
   }
-  const clearSelection = event.target.closest("[data-clear-path]");
-  if (clearSelection) {
-    const index = Number(clearSelection.dataset.clearPath);
-    clearTimeout(state.searchTimers[index]);
-    state.searchVersions[index] = (state.searchVersions[index] || 0) + 1;
-    state.pathSlots[index] = "";
-    state.pathSelections[index] = false;
-    state.suggestions[index] = [];
-    state.activeSuggestion = null;
-    state.suggestionCursor = null;
+  const removeSelected = event.target.closest("[data-remove-selected-path]");
+  if (removeSelected) {
+    state.selectedPaths.splice(Number(removeSelected.dataset.removeSelectedPath), 1);
     renderPathRows();
-    document.querySelector(`[data-path-index="${index}"]`)?.focus();
+    state.suppressPathFocus = true;
+    document.querySelector(".path-input")?.focus();
+    state.suppressPathFocus = false;
   }
 });
 
 document.addEventListener("input", event => {
   if (event.target.matches(".path-input")) {
-    const index = Number(event.target.dataset.pathIndex);
-    state.pathSlots[index] = event.target.value;
-    state.pathSelections[index] = false;
-    searchPath(index, event.target.value);
+    state.pathQuery = event.target.value;
+    searchPath(event.target.value);
   }
   if (event.target.id === "build-filter") {
     state.buildFilter = event.target.value;
@@ -568,7 +550,7 @@ document.addEventListener("input", event => {
 });
 
 document.addEventListener("focusin", event => {
-  if (!state.suppressPathFocus && event.target.matches(".path-input")) searchPath(Number(event.target.dataset.pathIndex), event.target.value);
+  if (!state.suppressPathFocus && event.target.matches(".path-input")) searchPath(event.target.value);
 });
 
 document.addEventListener("focusout", event => {
@@ -580,9 +562,8 @@ document.addEventListener("focusout", event => {
 document.addEventListener("keydown", event => {
   const pathInput = event.target.closest?.(".path-input");
   if (pathInput && !event.isComposing) {
-    const index = Number(pathInput.dataset.pathIndex);
-    const suggestions = state.suggestions[index] || [];
-    if ((event.key === "ArrowDown" || event.key === "ArrowUp") && state.activeSuggestion === index) {
+    const suggestions = state.suggestions;
+    if ((event.key === "ArrowDown" || event.key === "ArrowUp") && state.suggestionsOpen) {
       event.preventDefault();
       if (suggestions.length) {
         const direction = event.key === "ArrowDown" ? 1 : -1;
@@ -590,17 +571,17 @@ document.addEventListener("keydown", event => {
         const cursor = current === null
           ? (direction > 0 ? 0 : suggestions.length - 1)
           : (current + direction + suggestions.length) % suggestions.length;
-        updateSuggestionCursor(index, cursor);
+        updateSuggestionCursor(cursor);
       }
       return;
     }
-    if (event.key === "Enter" && state.activeSuggestion === index && state.suggestionCursor !== null) {
+    if (event.key === "Enter" && state.suggestionsOpen && state.suggestionCursor !== null) {
       event.preventDefault();
-      selectPathSuggestion(index, suggestions[state.suggestionCursor]);
+      selectPathSuggestion(suggestions[state.suggestionCursor]);
       return;
     }
   }
-  if (event.key === "Escape" && state.activeSuggestion !== null) {
+  if (event.key === "Escape" && state.suggestionsOpen) {
     event.preventDefault();
     closePathSuggestions();
     return;
