@@ -51,8 +51,9 @@ JENKINS_TIMEOUT_SECONDS = 30
 JENKINS_POLL_INTERVAL_SECONDS = 3
 JENKINS_BUILD_TIMEOUT_SECONDS = 6 * 60 * 60
 JENKINS_STATUS_RETRY_ATTEMPTS = 3
-GIT_STALE_INDEX_LOCK_SECONDS = 10 * 60
 GIT_ABANDONED_INDEX_LOCK_SECONDS = 24 * 60 * 60
+GIT_INDEX_LOCK_RETRY_ATTEMPTS = 5
+GIT_INDEX_LOCK_RETRY_DELAY_SECONDS = 2
 NODE_STDOUT_COMPAT_PATH = BASE_DIR / "node_stdout_compat.js"
 
 
@@ -196,17 +197,23 @@ def load_config() -> Dict[str, Dict[str, Any]]:
         if not resource_subpath.parts or resource_subpath.is_absolute() or ".." in resource_subpath.parts:
             raise RuntimeError(f"Job {job_id} 的资源子路径无效")
         config["project_root"] = str(project_root)
+        config["resource_repo_root"] = (
+            str(resource_base_root) if resource_base_root else ""
+        )
         config["resource_root"] = (
             str((resource_base_root / resource_subpath).resolve())
             if resource_base_root
             else ""
         )
+        config.setdefault("resource_branch", "master")
         config.setdefault("display_name", job_id.upper())
         config.setdefault("description", "资源更新与 OTA 构建")
         config.setdefault("exclude_dirs", [".git", "node_modules", "Library", "Temp"])
         config.setdefault("max_search_depth", 8)
         if not str(config.get("branch", "")).strip():
             raise RuntimeError(f"Job {job_id} 未配置主分支")
+        if not str(config.get("resource_branch", "")).strip():
+            raise RuntimeError(f"Job {job_id} 未配置资源仓库分支")
         if not str(config.get("jenkins_job_url", "")).strip():
             raise RuntimeError(f"Job {job_id} 未配置 Jenkins Job URL")
         jobs[job_id] = config
@@ -329,6 +336,19 @@ def _log_tail(log: TextIO, limit: int = 1600) -> str:
     return lines[-1] if lines else ""
 
 
+def _command_output_since(log: TextIO, start_offset: int, limit: int = 16_000) -> str:
+    log.flush()
+    try:
+        log_path = Path(log.name)
+        end_offset = log_path.stat().st_size
+        read_offset = max(start_offset, end_offset - limit)
+        with log_path.open("rb") as file:
+            file.seek(read_offset)
+            return file.read().decode("utf-8", errors="replace")
+    except (OSError, TypeError):
+        return ""
+
+
 def run_command(
     command: List[str],
     cwd: Path,
@@ -338,28 +358,76 @@ def run_command(
     env: Optional[Dict[str, str]] = None,
 ) -> None:
     display = shlex.join(command)
-    log.write(f"\n[{step}] $ {display}\n")
-    log.flush()
-    try:
-        result = subprocess.run(
-            command,
-            cwd=str(cwd),
-            env=env,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            check=False,
-            timeout=timeout,
+    is_git_command = bool(command) and command[0] == "git"
+    max_attempts = 1 + (GIT_INDEX_LOCK_RETRY_ATTEMPTS if is_git_command else 0)
+    for attempt in range(1, max_attempts + 1):
+        if attempt > 1:
+            log.write(
+                f"[Git] 自动重试 {attempt - 1}/{GIT_INDEX_LOCK_RETRY_ATTEMPTS}\n"
+            )
+        log.write(f"\n[{step}] $ {display}\n")
+        log.flush()
+        try:
+            output_offset = Path(log.name).stat().st_size
+        except (OSError, TypeError):
+            output_offset = 0
+        try:
+            result = subprocess.run(
+                command,
+                cwd=str(cwd),
+                env=env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                check=False,
+                timeout=timeout,
+            )
+        except FileNotFoundError as exc:
+            raise PipelineError(f"{step}失败：找不到命令 {command[0]}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise PipelineError(f"{step}超时（{timeout} 秒）") from exc
+        except OSError as exc:
+            raise PipelineError(f"{step}失败：{exc}") from exc
+        if result.returncode == 0:
+            return
+
+        command_output = _command_output_since(log, output_offset)
+        lock_paths = [path for path in _git_index_lock_paths(cwd) if path.exists()]
+        lock_message = command_output.lower()
+        has_lock_conflict = bool(lock_paths) or (
+            "index.lock" in lock_message and "file exists" in lock_message
         )
-    except FileNotFoundError as exc:
-        raise PipelineError(f"{step}失败：找不到命令 {command[0]}") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise PipelineError(f"{step}超时（{timeout} 秒）") from exc
-    except OSError as exc:
-        raise PipelineError(f"{step}失败：{exc}") from exc
-    if result.returncode != 0:
         detail = _log_tail(log)
         suffix = f"：{detail}" if detail else ""
-        raise PipelineError(f"{step}失败（退出码 {result.returncode}）{suffix}")
+        error = PipelineError(f"{step}失败（退出码 {result.returncode}）{suffix}")
+        if not is_git_command or not has_lock_conflict:
+            raise error
+
+        log.write(
+            f"[Git] 检测到 index.lock 冲突，正在自动处理"
+            f"（{attempt}/{max_attempts}）\n"
+        )
+        clear_stale_git_index_locks(cwd, log)
+        remaining_locks = [
+            path for path in _git_index_lock_paths(cwd) if path.exists()
+        ]
+        if attempt >= max_attempts:
+            log.write("[Git] index.lock 冲突自动重试次数已用尽\n")
+            log.flush()
+            raise error
+        if remaining_locks:
+            log.write(
+                f"[Git] 锁仍被占用，{GIT_INDEX_LOCK_RETRY_DELAY_SECONDS} 秒后重试\n"
+            )
+            log.flush()
+            time.sleep(GIT_INDEX_LOCK_RETRY_DELAY_SECONDS)
+
+
+def _git_index_lock_paths(project_root: Path) -> List[Path]:
+    git_dir = project_root / ".git"
+    lock_paths = [git_dir / "index.lock"]
+    if git_dir.is_dir():
+        lock_paths.extend(git_dir.glob("modules/**/index.lock"))
+    return sorted(set(lock_paths))
 
 
 def _git_lock_in_use(lock_path: Path) -> Optional[bool]:
@@ -382,14 +450,9 @@ def _git_lock_in_use(lock_path: Path) -> Optional[bool]:
 
 
 def clear_stale_git_index_locks(project_root: Path, log: TextIO) -> None:
-    """清理主仓库和递归子模块中已确认过期的 index.lock。"""
-    git_dir = project_root / ".git"
-    lock_paths = [git_dir / "index.lock"]
-    if git_dir.is_dir():
-        lock_paths.extend(git_dir.glob("modules/**/index.lock"))
-
+    """清理主仓库和递归子模块中已确认无人占用的 index.lock。"""
     now = time.time()
-    for lock_path in sorted(set(lock_paths)):
+    for lock_path in _git_index_lock_paths(project_root):
         try:
             lock_stat = lock_path.stat()
         except FileNotFoundError:
@@ -398,13 +461,6 @@ def clear_stale_git_index_locks(project_root: Path, log: TextIO) -> None:
             raise PipelineError(f"检查 Git 锁文件失败：{lock_path}：{exc}") from exc
 
         age_seconds = max(0.0, now - lock_stat.st_mtime)
-        if age_seconds < GIT_STALE_INDEX_LOCK_SECONDS:
-            log.write(
-                f"[Git] 保留最近创建的锁文件：{lock_path}"
-                f"（{round(age_seconds)} 秒）\n"
-            )
-            continue
-
         in_use = _git_lock_in_use(lock_path)
         if in_use is True:
             log.write(f"[Git] 锁文件仍被进程使用，暂不清理：{lock_path}\n")
@@ -425,9 +481,9 @@ def clear_stale_git_index_locks(project_root: Path, log: TextIO) -> None:
         except FileNotFoundError:
             continue
         except OSError as exc:
-            raise PipelineError(f"清理过期 Git 锁文件失败：{lock_path}：{exc}") from exc
+            raise PipelineError(f"清理残留 Git 锁文件失败：{lock_path}：{exc}") from exc
         log.write(
-            f"[Git] 已自动清理过期锁文件：{lock_path}"
+            f"[Git] 已自动清理残留锁文件：{lock_path}"
             f"（{round(age_seconds)} 秒）\n"
         )
     log.flush()
@@ -665,15 +721,71 @@ def execute_build_pipeline(
 ) -> str:
     project_root = Path(config["project_root"])
     branch = str(config["branch"])
+    resource_repo_root_value = str(config.get("resource_repo_root", "")).strip()
+    if not resource_repo_root_value:
+        raise PipelineError("资源仓库根路径未配置，请设置环境变量 TP_RES_ROOT")
+    resource_repo_root = Path(resource_repo_root_value)
+    resource_branch = str(config.get("resource_branch", "master")).strip()
     compile_file = project_root / "compile.coffee"
     git_dir = project_root / ".git"
+    resource_git_dir = resource_repo_root / ".git"
     if not git_dir.exists():
         raise PipelineError(f"项目根路径不是 Git 仓库：{project_root}")
+    if not resource_repo_root.is_dir():
+        raise PipelineError(f"资源仓库根路径不存在：{resource_repo_root}")
+    if not resource_git_dir.exists():
+        raise PipelineError(f"资源仓库根路径不是 Git 仓库：{resource_repo_root}")
     if not compile_file.is_file():
         raise PipelineError(f"找不到资源编译脚本：{compile_file}")
 
     command_env = os.environ.copy()
     command_env["GIT_TERMINAL_PROMPT"] = "0"
+    log.write(f"[资源仓库] 清理并更新 {resource_branch} 分支\n")
+    log.flush()
+    clear_stale_git_index_locks(resource_repo_root, log)
+    run_command(
+        ["git", "reset", "--hard"],
+        resource_repo_root,
+        log,
+        "清理资源仓库本地修改",
+        GIT_TIMEOUT_SECONDS,
+        command_env,
+    )
+    run_command(
+        ["git", "clean", "-fd"],
+        resource_repo_root,
+        log,
+        "清理资源仓库未跟踪文件",
+        GIT_TIMEOUT_SECONDS,
+        command_env,
+    )
+    run_command(
+        ["git", "fetch", "origin", resource_branch],
+        resource_repo_root,
+        log,
+        "拉取资源仓库远端分支",
+        GIT_TIMEOUT_SECONDS,
+        command_env,
+    )
+    run_command(
+        ["git", "checkout", "-B", resource_branch, f"origin/{resource_branch}"],
+        resource_repo_root,
+        log,
+        "切换资源仓库主分支",
+        GIT_TIMEOUT_SECONDS,
+        command_env,
+    )
+    run_command(
+        ["git", "pull", "--ff-only", "origin", resource_branch],
+        resource_repo_root,
+        log,
+        "更新资源仓库主分支",
+        GIT_TIMEOUT_SECONDS,
+        command_env,
+    )
+
+    log.write(f"[客户端仓库] 清理并更新 {branch} 分支\n")
+    log.flush()
     clear_stale_git_index_locks(project_root, log)
     run_command(["git", "reset", "--hard"], project_root, log, "清理本地修改", GIT_TIMEOUT_SECONDS, command_env)
     run_command(["git", "clean", "-fd"], project_root, log, "清理未跟踪文件", GIT_TIMEOUT_SECONDS, command_env)

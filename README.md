@@ -35,7 +35,7 @@ python3 server.py serve --host 0.0.0.0 --port 8765
 | 环境变量 | 内容 |
 | --- | --- |
 | `TP_CLIENT_ROOT` | TP1/TP4 共用的项目 Git 根路径，必填 |
-| `TP_RES_ROOT` | 资源总根目录；未设置时资源路径列表为空 |
+| `TP_RES_ROOT` | 资源 Git 仓库根目录；构建时会清理本地修改并更新 `master`，未设置时资源路径列表为空且无法构建 |
 | `JENKINS_USER` | Jenkins 用户名，可匿名触发时不填 |
 | `JENKINS_API_TOKEN` | Jenkins API Token，与 `JENKINS_USER` 同时设置 |
 
@@ -53,12 +53,13 @@ TP1 与 TP4 使用同一份 `TP_CLIENT_ROOT` 工作区，但分别切换到：
 
 每次构建会串行执行：
 
-1. 自动清理未被进程占用的过期 `index.lock`，执行 `git reset --hard`、`git clean -fd`，递归清理现有子模块修改，然后切换对应主分支并拉取最新代码。
-2. 执行 `git submodule sync --recursive` 和 `git submodule update --init --recursive --force`，再递归清理子模块中的本地修改与未跟踪文件。
-3. 执行 `coffee compile.coffee res`，每条资源路径使用一个 `-d <path>` 参数；服务端会为旧版脚本补充非 TTY 输出兼容方法。
-4. 执行 `git add -A` 并推送对应主分支；构建说明非空时提交信息为 `res:{构建说明}`，否则为 `res`。
-5. 读取 Jenkins 参数定义，将 `branch` 固定为 `beta`、`alert` 固定为 `true`，其余布尔参数设为 `false`、其余参数设为空，然后调用 `buildWithParameters`。
-6. 轮询 Jenkins 队列和实际构建（自动修正 Jenkins 返回的 localhost 地址，并对临时查询失败进行重试），保存 OTA 版本号，直到获得最终结果并更新本地记录和日志。
+1. 在 `TP_RES_ROOT` 资源仓库中自动清理未被进程占用的残留 `index.lock`，执行 `git reset --hard`、`git clean -fd`，然后切换到 `master` 并拉取远端最新资源。任一 Git 命令遇到 `index.lock` 冲突时，会安全清理或等待占用进程，并最多自动重试 5 次。
+2. 在 `TP_CLIENT_ROOT` 客户端仓库中执行相同的锁清理、`git reset --hard` 和 `git clean -fd`，递归清理现有子模块修改，然后切换对应项目主分支并拉取最新代码。
+3. 执行 `git submodule sync --recursive` 和 `git submodule update --init --recursive --force`，再递归清理子模块中的本地修改与未跟踪文件。
+4. 执行 `coffee compile.coffee res`，每条资源路径使用一个 `-d <path>` 参数；服务端会为旧版脚本补充非 TTY 输出兼容方法。
+5. 执行 `git add -A` 并推送对应主分支；构建说明非空时提交信息为 `res:{构建说明}`，否则为 `res`。
+6. 读取 Jenkins 参数定义，将 `branch` 固定为 `beta`、`alert` 固定为 `true`，其余布尔参数设为 `false`、其余参数设为空，然后调用 `buildWithParameters`。
+7. 轮询 Jenkins 队列和实际构建（自动修正 Jenkins 返回的 localhost 地址，并对临时查询失败进行重试），保存 OTA 版本号，直到获得最终结果并更新本地记录和日志。
 
 点击开始构建时会先生成“构建中”记录并返回项目列表；由于 TP1/TP4 共用工作区，后续并发请求显示为“等待中”，由单线程构建池依次处理。命令输出会合并保存到对应构建日志，任一步骤失败都会停止后续操作，并把记录更新为失败状态。
 
