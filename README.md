@@ -57,7 +57,7 @@ TP1 与 TP4 使用同一份 `TP_CLIENT_ROOT` 工作区，但分别切换到：
 2. 在 `TP_CLIENT_ROOT` 客户端仓库中执行相同的锁清理、`git reset --hard` 和 `git clean -fd`，递归清理现有子模块修改，然后切换对应项目主分支并拉取最新代码。
 3. 执行 `git submodule sync --recursive` 和 `git submodule update --init --recursive --force`，再递归清理子模块中的本地修改与未跟踪文件。
 4. 执行 `coffee compile.coffee res`，每条资源路径使用一个 `-d <path>` 参数；服务端会为旧版脚本补充非 TTY 输出兼容方法。
-5. 执行 `git add -A` 并推送对应主分支；构建说明非空时提交信息为 `res:{构建说明}`，否则为 `res`。
+5. 执行 `git add -A`，以 `res_bot(登录用户名) <res_bot@local>` 作为 author 提交并推送对应主分支（例如 `res_bot(tester)`）；构建说明非空时提交信息为 `res:{构建说明}`，否则为 `res`。
 6. 读取 Jenkins 参数定义，将 `branch` 固定为 `beta`、`alert` 固定为 `true`，其余布尔参数设为 `false`、其余参数设为空，然后调用 `buildWithParameters`。
 7. 轮询 Jenkins 队列和实际构建（自动修正 Jenkins 返回的 localhost 地址，并对临时查询失败进行重试），保存 OTA 版本号，直到获得最终结果并更新本地记录和日志。
 

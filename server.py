@@ -54,6 +54,7 @@ JENKINS_STATUS_RETRY_ATTEMPTS = 3
 GIT_ABANDONED_INDEX_LOCK_SECONDS = 24 * 60 * 60
 GIT_INDEX_LOCK_RETRY_ATTEMPTS = 5
 GIT_INDEX_LOCK_RETRY_DELAY_SECONDS = 2
+GIT_COMMIT_AUTHOR_EMAIL = "res_bot@local"
 NODE_STDOUT_COMPAT_PATH = BASE_DIR / "node_stdout_compat.js"
 
 
@@ -717,7 +718,11 @@ def wait_for_jenkins(
 
 
 def execute_build_pipeline(
-    config: Dict[str, Any], resource_paths: List[str], note: str, log: TextIO
+    config: Dict[str, Any],
+    resource_paths: List[str],
+    note: str,
+    username: str,
+    log: TextIO,
 ) -> str:
     project_root = Path(config["project_root"])
     branch = str(config["branch"])
@@ -810,7 +815,15 @@ def execute_build_pipeline(
 
     run_command(["git", "add", "-A"], project_root, log, "暂存资源修改", GIT_TIMEOUT_SECONDS, command_env)
     commit_message = f"res:{note}" if note else "res"
-    run_command(["git", "commit", "-m", commit_message], project_root, log, "提交资源修改", GIT_TIMEOUT_SECONDS, command_env)
+    commit_author = f"res_bot({username}) <{GIT_COMMIT_AUTHOR_EMAIL}>"
+    run_command(
+        ["git", "commit", "--author", commit_author, "-m", commit_message],
+        project_root,
+        log,
+        "提交资源修改",
+        GIT_TIMEOUT_SECONDS,
+        command_env,
+    )
     run_command(["git", "push", "origin", f"HEAD:{branch}"], project_root, log, "推送资源修改", GIT_TIMEOUT_SECONDS, command_env)
     return trigger_jenkins(config, log)
 
@@ -933,7 +946,9 @@ class BuildManager:
                 log.write(f"[{utc_now()}] 开始执行 {build['job_id']} 资源更新流水线\n")
                 log.write(json.dumps(parameters, ensure_ascii=False, indent=2) + "\n")
                 log.flush()
-                queue_url = execute_build_pipeline(config, resource_paths, note, log)
+                queue_url = execute_build_pipeline(
+                    config, resource_paths, note, str(build["username"]), log
+                )
                 parameters["jenkins_queue_url"] = queue_url
                 update_build_parameters(build_id, parameters)
 
