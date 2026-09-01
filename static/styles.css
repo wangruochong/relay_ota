@@ -178,6 +178,12 @@ svg { fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round
 .path-input-wrap .input-wrap { height: 43px; }
 .path-input-wrap .input-wrap svg { width: 17px; height: 17px; }
 .path-input-wrap input { font-size: 12px; }
+.path-input-wrap .input-wrap.path-input-required { animation: path-required-attention 2s ease-out; }
+@keyframes path-required-attention {
+  0% { border-color: #d74545; box-shadow: 0 0 0 5px rgba(201,52,52,.2); }
+  28% { border-color: #df6868; box-shadow: 0 0 0 3px rgba(201,52,52,.12); }
+  100% { border-color: #d7dfdc; box-shadow: 0 0 0 0 rgba(201,52,52,0); }
+}
 .path-suggestions { position: absolute; z-index: 15; top: calc(100% + 6px); left: 0; right: 0; overflow-y: auto; max-height: 245px; padding: 6px; border: 1px solid var(--line); border-radius: 11px; background: white; box-shadow: var(--shadow); }
 .suggestion-item { width: 100%; display: flex; align-items: center; gap: 9px; padding: 9px 10px; border: 0; border-radius: 7px; background: white; color: #3b4946; text-align: left; font-size: 11px; cursor: pointer; }
 .suggestion-item:hover, .suggestion-item.is-active { color: var(--green); background: var(--green-soft); }

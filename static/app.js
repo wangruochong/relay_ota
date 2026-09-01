@@ -18,6 +18,7 @@ const state = {
   highlightedBuildId: null,
   highlightedBuildPending: false,
   highlightedBuildTimer: null,
+  pathRequiredTimer: null,
 };
 
 const icons = {
@@ -334,6 +335,27 @@ function animateNewPathChip(index) {
   window.setTimeout(clearAnimation, 2000);
 }
 
+function clearPathRequiredHighlight() {
+  clearTimeout(state.pathRequiredTimer);
+  state.pathRequiredTimer = null;
+  document.querySelector(".path-input-wrap .input-wrap")?.classList.remove("path-input-required");
+}
+
+function showPathRequiredHighlight() {
+  const field = document.querySelector(".path-input-wrap .input-wrap");
+  if (!field) return;
+  clearTimeout(state.pathRequiredTimer);
+  field.classList.remove("path-input-required");
+  void field.offsetWidth;
+  field.classList.add("path-input-required");
+  const clearAnimation = () => {
+    field.classList.remove("path-input-required");
+    state.pathRequiredTimer = null;
+  };
+  field.addEventListener("animationend", clearAnimation, { once: true });
+  state.pathRequiredTimer = window.setTimeout(clearAnimation, 2200);
+}
+
 function buildListItem(build) {
   const status = statusMap[build.status] || statusMap.queued;
   const highlighted = state.highlightedBuildPending && state.highlightedBuildId === build.id ? " build-item-new" : "";
@@ -423,7 +445,7 @@ async function submitBuild(event) {
   if (!resourcePaths.length) {
     const hasInput = Boolean(state.pathQuery.trim());
     toast(hasInput ? "请从模糊匹配列表中选择资源更新路径" : "玩家资源更新路径为空", "error");
-    document.querySelector(".path-input")?.focus();
+    showPathRequiredHighlight();
     return;
   }
   if (state.pathQuery.trim()) {
@@ -550,6 +572,7 @@ document.addEventListener("click", event => {
 
 document.addEventListener("input", event => {
   if (event.target.matches(".path-input")) {
+    clearPathRequiredHighlight();
     state.pathQuery = event.target.value;
     searchPath(event.target.value);
   }
