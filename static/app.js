@@ -221,9 +221,9 @@ async function renderJob(jobId) {
 
 function buildFormHTML() {
   return `<form id="build-form" class="build-form">
-    <section class="form-section"><div class="section-heading"><div><h3>资源更新路径 <span class="subtle">*</span></h3><p>输入关键词检索目录，支持同时更新多个路径</p></div></div><div id="path-rows"></div><div id="selected-paths"></div></section>
+    <section class="form-section"><div class="section-heading"><div><h3>资源更新路径 <span class="subtle">*</span></h3><p>输入关键词检索目录，支持模糊匹配和多路径</p></div></div><div id="path-rows"></div><div id="selected-paths"></div></section>
     <section class="form-section"><label><span class="field-label">构建说明</span><textarea id="note" maxlength="500" placeholder="简要说明本次更新内容，方便团队成员追溯（可选）"></textarea></label></section>
-    <div class="form-footer"><span class="form-footer-note"><svg viewBox="0 0 24 24"><path d="M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20Z"/><path d="M12 16v-4M12 8h.01"/></svg>将更新资源、提交代码并触发 Jenkins OTA</span><button id="build-submit" class="button primary build-submit" type="submit">开始构建 <span>→</span></button></div>
+    <div class="form-footer"><span class="form-footer-note"><svg viewBox="0 0 24 24"><path d="M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20Z"/><path d="M12 16v-4M12 8h.01"/></svg>将更新资源并触发 Jenkins OTA</span><button id="build-submit" class="button primary build-submit" type="submit">开始构建 <span>→</span></button></div>
   </form>`;
 }
 
