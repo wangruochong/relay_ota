@@ -95,13 +95,35 @@ function navigate(path) {
   route();
 }
 
+function updateWordmarkNavigation(interactive) {
+  const wordmark = document.querySelector("#wordmark");
+  if (!wordmark) return;
+  wordmark.classList.toggle("is-link", interactive);
+  if (interactive) {
+    wordmark.dataset.nav = "/";
+    wordmark.setAttribute("role", "link");
+    wordmark.setAttribute("tabindex", "0");
+    wordmark.setAttribute("aria-label", "返回项目列表");
+    wordmark.setAttribute("title", "返回项目列表");
+  } else {
+    delete wordmark.dataset.nav;
+    wordmark.removeAttribute("role");
+    wordmark.removeAttribute("tabindex");
+    wordmark.removeAttribute("aria-label");
+    wordmark.removeAttribute("title");
+  }
+}
+
 async function route() {
   closeDrawer();
   clearInterval(state.pollTimer);
   const match = location.pathname.match(/^\/jobs\/([^/]+)$/);
-  if (match) await renderJob(decodeURIComponent(match[1]));
-  else {
+  if (match) {
+    updateWordmarkNavigation(true);
+    await renderJob(decodeURIComponent(match[1]));
+  } else {
     if (location.pathname !== "/") history.replaceState({}, "", "/");
+    updateWordmarkNavigation(false);
     await renderJobs();
   }
 }
@@ -593,6 +615,12 @@ document.addEventListener("focusout", event => {
 });
 
 document.addEventListener("keydown", event => {
+  const wordmark = event.target.closest?.(".wordmark.is-link[data-nav]");
+  if (wordmark && event.key === "Enter") {
+    event.preventDefault();
+    navigate(wordmark.dataset.nav);
+    return;
+  }
   const pathInput = event.target.closest?.(".path-input");
   if (pathInput && !event.isComposing) {
     const suggestions = state.suggestions;
