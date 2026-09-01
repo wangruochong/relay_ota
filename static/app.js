@@ -319,9 +319,19 @@ function selectPathSuggestion(path) {
   state.suggestionsOpen = false;
   state.suggestionCursor = null;
   renderPathRows();
+  animateNewPathChip(state.selectedPaths.length - 1);
   state.suppressPathFocus = true;
   document.querySelector(".path-input")?.focus();
   state.suppressPathFocus = false;
+}
+
+function animateNewPathChip(index) {
+  const chip = document.querySelectorAll(".path-chip")[index];
+  if (!chip) return;
+  chip.classList.add("path-chip-new");
+  const clearAnimation = () => chip.classList.remove("path-chip-new");
+  chip.addEventListener("animationend", clearAnimation, { once: true });
+  window.setTimeout(clearAnimation, 2000);
 }
 
 function buildListItem(build) {

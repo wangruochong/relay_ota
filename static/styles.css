@@ -189,11 +189,24 @@ svg { fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round
 .selected-empty { color: #98a29f; font-size: 11px; }
 .path-chips { display: flex; flex-wrap: wrap; gap: 7px; }
 .path-chip { display: inline-flex; align-items: center; gap: 6px; max-width: min(100%, 360px); min-height: 30px; padding: 5px 5px 5px 9px; border: 1px solid #d8e9e3; border-radius: 7px; color: #27564b; background: #e8f3ef; font-size: 10px; }
+.path-chip-new { animation: path-chip-arrival 1.8s cubic-bezier(.2,.75,.25,1); }
+@keyframes path-chip-arrival {
+  0% { opacity: .15; transform: translateY(-7px) scale(.92); border-color: #43a68d; background: #c9eadf; box-shadow: 0 0 0 5px rgba(22,137,111,.2); }
+  18% { opacity: 1; transform: translateY(0) scale(1); }
+  52% { border-color: #79bfae; background: #d9efe7; box-shadow: 0 0 0 2px rgba(22,137,111,.08); }
+  100% { opacity: 1; transform: translateY(0) scale(1); border-color: #d8e9e3; background: #e8f3ef; box-shadow: 0 0 0 0 rgba(22,137,111,0); }
+}
+@keyframes path-chip-highlight {
+  0% { border-color: #43a68d; background: #c9eadf; box-shadow: 0 0 0 5px rgba(22,137,111,.2); }
+  52% { border-color: #79bfae; background: #d9efe7; box-shadow: 0 0 0 2px rgba(22,137,111,.08); }
+  100% { border-color: #d8e9e3; background: #e8f3ef; box-shadow: 0 0 0 0 rgba(22,137,111,0); }
+}
 .path-chip > svg { flex: 0 0 auto; width: 13px; height: 13px; }
 .path-chip > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .path-chip button { flex: 0 0 auto; width: 21px; height: 21px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 5px; color: #6f7f7b; background: transparent; cursor: pointer; }
 .path-chip button:hover { color: var(--red); background: var(--red-soft); }
 .path-chip button svg { width: 12px; height: 12px; }
+@media (prefers-reduced-motion: reduce) { .path-chip-new { animation: path-chip-highlight 1.8s ease-out; } }
 textarea { width: 100%; border: 1px solid #d7dfdc; border-radius: 9px; outline: none; color: var(--ink); background: white; font-size: 12px; transition: border-color .2s, box-shadow .2s; }
 textarea { min-height: 78px; padding: 12px 13px; resize: vertical; line-height: 1.5; }
 textarea:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(19,124,104,.1); }
