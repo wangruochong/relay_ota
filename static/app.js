@@ -19,6 +19,7 @@ const state = {
   highlightedBuildPending: false,
   highlightedBuildTimer: null,
   pathRequiredTimer: null,
+  logRefreshVersion: 0,
 };
 
 const icons = {
@@ -455,7 +456,10 @@ function startPolling() {
       const selected = state.builds.find(build => build.id === selectedId);
       const statusChanged = selected && drawer.dataset.buildStatus !== selected.status;
       if (selected && statusChanged && !drawerHasTextSelection(drawer)) {
-        renderDrawer(selected, false);
+        updateDrawerSummary(selected);
+      }
+      if (selected && (["queued", "running"].includes(selected.status) || statusChanged)) {
+        await refreshBuildLog(selected.id);
       }
     } catch (_error) { /* 下一轮自动重试 */ }
   }, 2000);
@@ -505,6 +509,7 @@ async function submitBuild(event) {
 
 async function openBuildDrawer(buildId) {
   const drawer = document.querySelector("#build-drawer");
+  state.logRefreshVersion += 1;
   drawer.dataset.buildId = String(buildId);
   drawer.innerHTML = '<div class="drawer-loading">正在加载构建详情…</div>';
   drawer.classList.add("open");
@@ -512,33 +517,81 @@ async function openBuildDrawer(buildId) {
   document.querySelector("#drawer-backdrop").classList.remove("hidden");
   try {
     const payload = await api(`/api/builds/${buildId}`);
-    renderDrawer(payload.build, true);
+    renderDrawer(payload.build);
+    await refreshBuildLog(payload.build.id);
   } catch (error) {
     drawer.innerHTML = `<div class="drawer-loading">${escapeHTML(error.message)}</div>`;
   }
 }
 
-async function renderDrawer(build, loadLog) {
+function drawerStatusHTML(build) {
+  const status = statusMap[build.status] || statusMap.queued;
+  const description = build.status === "running"
+    ? "打包机正在处理当前任务"
+    : build.status === "queued"
+      ? "任务正在等待空闲构建槽"
+      : `耗时 ${duration(build.duration_seconds)}`;
+  return `${statusHTML(build.status, true)}<div><h3>${status.label}</h3><p>${description}</p></div>`;
+}
+
+function renderDrawer(build) {
   const drawer = document.querySelector("#build-drawer");
   if (Number(drawer.dataset.buildId) !== build.id) return;
   drawer.dataset.buildStatus = build.status;
-  const status = statusMap[build.status] || statusMap.queued;
   drawer.innerHTML = `<div class="drawer-top"><div><p>BUILD DETAILS</p><h2>#${build.build_number} 构建详情</h2></div><button class="icon-button drawer-close" aria-label="关闭">${icons.failed}</button></div>
-    <div class="drawer-status">${statusHTML(build.status, true)}<div><h3>${status.label}</h3><p>${build.status === "running" ? "打包机正在处理当前任务" : build.status === "queued" ? "任务正在等待空闲构建槽" : `耗时 ${duration(build.duration_seconds)}`}</p></div></div>
-    <section class="detail-section"><h3>基础信息</h3><dl class="detail-grid"><div class="detail-row"><dt>构建项目</dt><dd>${escapeHTML(build.job_id.toUpperCase())}</dd></div><div class="detail-row"><dt>构建者</dt><dd>${escapeHTML(build.username)}</dd></div><div class="detail-row"><dt>提交时间</dt><dd>${formatDate(build.created_at)}</dd></div><div class="detail-row"><dt>开始时间</dt><dd>${formatDate(build.started_at)}</dd></div><div class="detail-row"><dt>完成时间</dt><dd>${formatDate(build.finished_at)}</dd></div>${build.error_message ? `<div class="detail-row failure-reason"><dt>失败原因</dt><dd>${escapeHTML(build.error_message)}</dd></div>` : ""}<div class="detail-row"><dt>OTA 版本号</dt><dd>${escapeHTML(build.parameters.jenkins_build_number ?? "—")}</dd></div></dl></section>
+    <div class="drawer-status">${drawerStatusHTML(build)}</div>
+    <section class="detail-section"><h3>基础信息</h3><dl class="detail-grid"><div class="detail-row"><dt>构建项目</dt><dd>${escapeHTML(build.job_id.toUpperCase())}</dd></div><div class="detail-row"><dt>构建者</dt><dd>${escapeHTML(build.username)}</dd></div><div class="detail-row"><dt>提交时间</dt><dd>${formatDate(build.created_at)}</dd></div><div class="detail-row"><dt>开始时间</dt><dd data-drawer-field="started-at">${formatDate(build.started_at)}</dd></div><div class="detail-row"><dt>完成时间</dt><dd data-drawer-field="finished-at">${formatDate(build.finished_at)}</dd></div><div class="detail-row failure-reason${build.error_message ? "" : " hidden"}" data-drawer-failure><dt>失败原因</dt><dd>${escapeHTML(build.error_message || "")}</dd></div><div class="detail-row"><dt>OTA 版本号</dt><dd data-drawer-field="ota-version">${escapeHTML(build.parameters.jenkins_build_number ?? "—")}</dd></div></dl></section>
     <section class="detail-section"><h3>构建参数</h3><dl class="detail-grid"><div class="detail-row"><dt>资源路径</dt><dd><span class="detail-paths">${(build.parameters.resource_paths || []).map(path => `<span class="detail-path">${escapeHTML(path)}</span>`).join("")}</span></dd></div><div class="detail-row"><dt>构建说明</dt><dd>${escapeHTML(build.parameters.note || "—")}</dd></div></dl></section>
-    <section class="detail-section"><h3>构建日志</h3><pre id="build-log" class="log-box">${loadLog ? "正在加载日志…" : "日志随状态自动更新…"}</pre></section>`;
-  if (loadLog || ["success", "failed"].includes(build.status)) {
-    try {
-      const payload = await api(`/api/builds/${build.id}/log`);
-      const log = document.querySelector("#build-log");
-      if (log) log.textContent = payload.log;
-    } catch (_error) { /* 详情信息仍可使用 */ }
+    <section class="detail-section"><h3>构建日志</h3><pre id="build-log" class="log-box">正在加载日志…</pre></section>`;
+}
+
+function updateDrawerSummary(build) {
+  const drawer = document.querySelector("#build-drawer");
+  if (Number(drawer.dataset.buildId) !== build.id) return;
+  drawer.dataset.buildStatus = build.status;
+  const statusRoot = drawer.querySelector(".drawer-status");
+  if (statusRoot) statusRoot.innerHTML = drawerStatusHTML(build);
+  const startedAt = drawer.querySelector('[data-drawer-field="started-at"]');
+  const finishedAt = drawer.querySelector('[data-drawer-field="finished-at"]');
+  const otaVersion = drawer.querySelector('[data-drawer-field="ota-version"]');
+  if (startedAt) startedAt.textContent = formatDate(build.started_at);
+  if (finishedAt) finishedAt.textContent = formatDate(build.finished_at);
+  if (otaVersion) otaVersion.textContent = build.parameters.jenkins_build_number ?? "—";
+  const failure = drawer.querySelector("[data-drawer-failure]");
+  if (failure) {
+    failure.classList.toggle("hidden", !build.error_message);
+    const message = failure.querySelector("dd");
+    if (message) message.textContent = build.error_message || "";
   }
+}
+
+async function refreshBuildLog(buildId) {
+  const drawer = document.querySelector("#build-drawer");
+  if (Number(drawer.dataset.buildId) !== buildId || drawerHasTextSelection(drawer)) return;
+  const requestVersion = state.logRefreshVersion + 1;
+  state.logRefreshVersion = requestVersion;
+  try {
+    const payload = await api(`/api/builds/${buildId}/log`);
+    if (state.logRefreshVersion !== requestVersion) return;
+    const currentDrawer = document.querySelector("#build-drawer");
+    const log = currentDrawer.querySelector("#build-log");
+    if (Number(currentDrawer.dataset.buildId) !== buildId || !log || drawerHasTextSelection(currentDrawer)) return;
+    const nextContent = String(payload.log ?? "");
+    if (log.textContent === nextContent) return;
+    const previousScrollTop = log.scrollTop;
+    const wasNearBottom = log.scrollHeight - log.clientHeight - log.scrollTop <= 24;
+    log.textContent = nextContent;
+    if (wasNearBottom) {
+      log.scrollTop = log.scrollHeight;
+    } else {
+      log.scrollTop = Math.min(previousScrollTop, Math.max(0, log.scrollHeight - log.clientHeight));
+    }
+  } catch (_error) { /* 日志轮询失败时等待下一轮自动重试 */ }
 }
 
 function closeDrawer() {
   const drawer = document.querySelector("#build-drawer");
+  state.logRefreshVersion += 1;
   drawer.classList.remove("open");
   drawer.setAttribute("aria-hidden", "true");
   drawer.dataset.buildId = "";
