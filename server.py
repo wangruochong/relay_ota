@@ -161,10 +161,35 @@ def add_user(username: str, password: str) -> None:
     if len(password) < 8:
         raise ValueError("密码至少需要 8 个字符")
     with connect_db() as conn:
-        conn.execute(
-            "INSERT INTO users(username, password_hash, created_at) VALUES (?, ?, ?)",
-            (username, hash_password(password), utc_now()),
-        )
+        existing = conn.execute(
+            "SELECT id, disabled FROM users WHERE username=?", (username,)
+        ).fetchone()
+        if existing and not existing["disabled"]:
+            raise ValueError("用户名已存在")
+        if existing:
+            conn.execute(
+                "UPDATE users SET password_hash=?, created_at=?, disabled=0 WHERE id=?",
+                (hash_password(password), utc_now(), existing["id"]),
+            )
+            conn.execute("DELETE FROM sessions WHERE user_id=?", (existing["id"],))
+        else:
+            conn.execute(
+                "INSERT INTO users(username, password_hash, created_at) VALUES (?, ?, ?)",
+                (username, hash_password(password), utc_now()),
+            )
+
+
+def delete_user(username: str) -> None:
+    """禁用账号并清除登录会话，保留关联的历史构建记录。"""
+    username = validate_username(username)
+    with connect_db() as conn:
+        existing = conn.execute(
+            "SELECT id, disabled FROM users WHERE username=?", (username,)
+        ).fetchone()
+        if not existing or existing["disabled"]:
+            raise ValueError("用户不存在")
+        conn.execute("UPDATE users SET disabled=1 WHERE id=?", (existing["id"],))
+        conn.execute("DELETE FROM sessions WHERE user_id=?", (existing["id"],))
 
 
 def load_config() -> Dict[str, Dict[str, Any]]:
@@ -1342,6 +1367,11 @@ def main() -> None:
     serve_parser.add_argument("--port", type=int, default=8765)
     user_parser = subparsers.add_parser("add-user", help="添加本地用户")
     user_parser.add_argument("username")
+    delete_user_parser = subparsers.add_parser(
+        "delete-user", help="删除本地用户（保留历史构建记录）"
+    )
+    delete_user_parser.add_argument("username")
+    delete_user_parser.add_argument("-y", "--yes", action="store_true", help="跳过确认提示")
     args = parser.parse_args()
     init_db()
     if args.command == "add-user":
@@ -1354,6 +1384,19 @@ def main() -> None:
         except (ValueError, sqlite3.IntegrityError) as exc:
             raise SystemExit(f"添加用户失败：{exc}")
         print(f"用户 {args.username} 已添加")
+    elif args.command == "delete-user":
+        if not args.yes:
+            answer = input(
+                f"确认删除用户 {args.username}？该用户将立即退出登录 [y/N]："
+            ).strip().lower()
+            if answer not in ("y", "yes"):
+                print("已取消删除")
+                return
+        try:
+            delete_user(args.username)
+        except ValueError as exc:
+            raise SystemExit(f"删除用户失败：{exc}")
+        print(f"用户 {args.username} 已删除，历史构建记录已保留")
     else:
         serve(getattr(args, "host", "0.0.0.0"), getattr(args, "port", 8765))
 

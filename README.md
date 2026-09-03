@@ -14,28 +14,36 @@
 
 ## 快速启动
 
-首次使用先添加本地账号：
+```bash
+python3 server.py serve --host 0.0.0.0 --port 8765
+```
+
+## 访问方式
+
+浏览器访问 `http://打包机IP:8765`。
+
+## 账号管理
+
+添加账号：
 
 ```bash
 python3 server.py add-user your_name
 ```
 
-然后启动服务：
+删除账号：
 
 ```bash
-export TP_CLIENT_ROOT=/absolute/path/to/TripeaksClient
-export TP_RES_ROOT=/absolute/path/to/TripeaksResources
-python3 server.py serve --host 0.0.0.0 --port 8765
+python3 server.py delete-user your_name
 ```
 
-浏览器访问 `http://打包机IP:8765`。数据库与构建日志会保存在 `data/` 下。
+删除账号会立即清除该账号的登录会话，但不会删除历史构建记录。删除过的用户名可以通过 `add-user` 重新添加并设置新密码。
 
 ## 环境变量
 
 | 环境变量 | 内容 |
 | --- | --- |
 | `TP_CLIENT_ROOT` | TP1/TP4 共用的项目 Git 根路径，必填 |
-| `TP_RES_ROOT` | 资源 Git 仓库根目录；构建时会清理本地修改并更新 `master`，未设置时资源路径列表为空且无法构建 |
+| `TP_RES_ROOT` | 资源 Git 仓库根目录，必填；构建时会清理本地修改并更新 `master` |
 | `JENKINS_USER` | Jenkins 用户名，可匿名触发时不填 |
 | `JENKINS_API_TOKEN` | Jenkins API Token，与 `JENKINS_USER` 同时设置 |
 
@@ -76,3 +84,14 @@ node --check static/app.js
 - 若需要跨公网访问，在前面增加 Nginx/Caddy HTTPS 反向代理。
 - 将 `data/ota_tool.db` 与 `data/logs/` 纳入打包机备份。
 - 真实构建脚本建议使用专用低权限系统账号运行。
+
+## 注意事项
+
+* 启动服务前，需要先设置以下两个环境变量：
+
+  - `TP_CLIENT_ROOT`：TP1/TP4 共用的客户端项目 Git 根路径
+
+  - `TP_RES_ROOT`：资源 Git 仓库根路径
+
+* 数据库与构建日志会保存在 `data/` 下。
+
