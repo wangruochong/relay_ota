@@ -20,6 +20,7 @@ const state = {
   highlightedBuildTimer: null,
   pathRequiredTimer: null,
   logRefreshVersion: 0,
+  pendingCancelBuildId: null,
 };
 
 const icons = {
@@ -27,6 +28,7 @@ const icons = {
   failed: '<svg viewBox="0 0 24 24"><path d="m8 8 8 8M16 8l-8 8"/></svg>',
   running: '<svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 4v6h-6"/></svg>',
   queued: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
+  stop: '<svg viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="1"/></svg>',
   chevron: '<svg viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg>',
   folder: '<svg viewBox="0 0 24 24"><path d="M3 6h6l2 2h10v11H3z"/></svg>',
 };
@@ -34,6 +36,8 @@ const icons = {
 const statusMap = {
   queued: { label: "等待中", icon: icons.queued },
   running: { label: "构建中", icon: icons.running },
+  cancelling: { label: "终止中", icon: icons.running },
+  cancelled: { label: "已终止", icon: icons.stop },
   success: { label: "构建成功", icon: icons.check },
   failed: { label: "构建失败", icon: icons.failed },
 };
@@ -465,7 +469,7 @@ function startPolling() {
       if (selected && statusChanged && !drawerHasTextSelection(drawer)) {
         updateDrawerSummary(selected);
       }
-      if (selected && (["queued", "running"].includes(selected.status) || statusChanged)) {
+      if (selected && (["queued", "running", "cancelling"].includes(selected.status) || statusChanged)) {
         await refreshBuildLog(selected.id);
       }
     } catch (_error) { /* 下一轮自动重试 */ }
@@ -533,12 +537,61 @@ async function openBuildDrawer(buildId) {
 
 function drawerStatusHTML(build) {
   const status = statusMap[build.status] || statusMap.queued;
-  const description = build.status === "running"
-    ? "打包机正在处理当前任务"
-    : build.status === "queued"
-      ? "任务正在等待空闲构建槽"
-      : `耗时 ${duration(build.duration_seconds)}`;
-  return `${statusHTML(build.status, true)}<div><h3>${status.label}</h3><p>${description}</p></div>`;
+  let description = `耗时 ${duration(build.duration_seconds)}`;
+  if (build.status === "running") description = "打包机正在处理当前任务";
+  if (build.status === "queued") description = "任务正在等待空闲构建槽";
+  if (build.status === "cancelling") description = "正在停止本地脚本或 Jenkins 构建";
+  if (build.status === "cancelled") description = `任务已终止 · 耗时 ${duration(build.duration_seconds)}`;
+  const cancelAction = ["queued", "running"].includes(build.status)
+    ? `<button class="build-cancel-button" type="button" data-cancel-build="${build.id}" aria-label="终止构建"><span aria-hidden="true">${icons.failed}</span></button>`
+    : "";
+  return `<div class="drawer-status-main">${statusHTML(build.status, true)}<div><h3>${status.label}</h3><p>${description}</p></div></div>${cancelAction}`;
+}
+
+function openCancelBuildDialog(buildId) {
+  const build = state.builds.find(item => item.id === buildId);
+  if (!build || !["queued", "running"].includes(build.status)) return;
+  state.pendingCancelBuildId = buildId;
+  document.querySelector("#cancel-build-number").textContent = `#${build.build_number}`;
+  const dialog = document.querySelector("#cancel-build-dialog");
+  if (!dialog.open) dialog.showModal();
+  document.querySelector("#cancel-build-confirm")?.focus();
+}
+
+function closeCancelBuildDialog() {
+  const dialog = document.querySelector("#cancel-build-dialog");
+  if (dialog.open) dialog.close();
+  state.pendingCancelBuildId = null;
+}
+
+async function confirmCancelBuild() {
+  const buildId = state.pendingCancelBuildId;
+  const build = state.builds.find(item => item.id === buildId);
+  if (!build || !["queued", "running"].includes(build.status)) {
+    closeCancelBuildDialog();
+    return;
+  }
+
+  const confirmButton = document.querySelector("#cancel-build-confirm");
+  confirmButton.disabled = true;
+  confirmButton.textContent = "正在提交…";
+  try {
+    const payload = await api(`/api/builds/${buildId}/cancel`, {
+      method: "POST",
+      body: "{}",
+    });
+    const index = state.builds.findIndex(item => item.id === buildId);
+    if (index >= 0) state.builds[index] = payload.build;
+    renderBuildList();
+    updateDrawerSummary(payload.build);
+    closeCancelBuildDialog();
+    toast(payload.build.status === "cancelled" ? "构建已终止" : "终止请求已提交");
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    confirmButton.disabled = false;
+    confirmButton.textContent = "确认终止";
+  }
 }
 
 function renderDrawer(build) {
@@ -606,6 +659,7 @@ async function refreshBuildLog(buildId) {
 }
 
 function closeDrawer() {
+  closeCancelBuildDialog();
   const drawer = document.querySelector("#build-drawer");
   state.logRefreshVersion += 1;
   drawer.classList.remove("open");
@@ -640,6 +694,20 @@ document.addEventListener("submit", event => {
 });
 
 document.addEventListener("click", event => {
+  const cancelButton = event.target.closest("[data-cancel-build]");
+  if (cancelButton) {
+    event.preventDefault();
+    openCancelBuildDialog(Number(cancelButton.dataset.cancelBuild));
+    return;
+  }
+  if (event.target.closest("[data-cancel-dialog-close]")) {
+    closeCancelBuildDialog();
+    return;
+  }
+  if (event.target.closest("#cancel-build-confirm")) {
+    confirmCancelBuild();
+    return;
+  }
   if (!event.target.closest(".path-input-wrap")) closePathSuggestions();
   const nav = event.target.closest("[data-nav]");
   if (nav) navigate(nav.dataset.nav);
@@ -685,6 +753,11 @@ document.addEventListener("focusout", event => {
 });
 
 document.addEventListener("keydown", event => {
+  if (event.key === "Escape" && document.querySelector("#cancel-build-dialog")?.open) {
+    event.preventDefault();
+    closeCancelBuildDialog();
+    return;
+  }
   const wordmark = event.target.closest?.(".wordmark.is-link[data-nav]");
   if (wordmark && event.key === "Enter") {
     event.preventDefault();
@@ -726,6 +799,10 @@ document.querySelector("#logout-button").addEventListener("click", async () => {
   try { await api("/api/logout", { method: "POST", body: "{}" }); } catch (_error) { /* 本地状态仍然退出 */ }
   history.replaceState({}, "", "/");
   showLogin();
+});
+
+document.querySelector("#cancel-build-dialog").addEventListener("close", () => {
+  state.pendingCancelBuildId = null;
 });
 
 window.addEventListener("popstate", route);

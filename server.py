@@ -14,6 +14,7 @@ import json
 import mimetypes
 import os
 import secrets
+import signal
 import shlex
 import sqlite3
 import subprocess
@@ -53,6 +54,8 @@ JENKINS_TIMEOUT_SECONDS = 30
 JENKINS_POLL_INTERVAL_SECONDS = 3
 JENKINS_BUILD_TIMEOUT_SECONDS = 6 * 60 * 60
 JENKINS_STATUS_RETRY_ATTEMPTS = 3
+JENKINS_CANCEL_TIMEOUT_SECONDS = 60
+LOCAL_CANCEL_GRACE_SECONDS = 3
 GIT_ABANDONED_INDEX_LOCK_SECONDS = 24 * 60 * 60
 GIT_INDEX_LOCK_RETRY_ATTEMPTS = 5
 GIT_INDEX_LOCK_RETRY_DELAY_SECONDS = 2
@@ -92,7 +95,7 @@ def init_db() -> None:
                 build_number INTEGER NOT NULL,
                 builder_account TEXT NOT NULL,
                 builder_name TEXT NOT NULL,
-                status TEXT NOT NULL CHECK(status IN ('queued','running','success','failed')),
+                status TEXT NOT NULL CHECK(status IN ('queued','running','cancelling','cancelled','success','failed')),
                 parameters_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 started_at TEXT,
@@ -105,9 +108,47 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_builds_job_id ON builds(job_id, id DESC);
             CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);
             CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account);
-            PRAGMA user_version = 2;
+            PRAGMA user_version = 3;
             """
         )
+        build_schema = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='builds'"
+        ).fetchone()
+        if build_schema and "'cancelled'" not in str(build_schema["sql"]):
+            conn.executescript(
+                """
+                DROP INDEX IF EXISTS idx_builds_job_id;
+                ALTER TABLE builds RENAME TO builds_before_cancel_status;
+                CREATE TABLE builds (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT NOT NULL,
+                    build_number INTEGER NOT NULL,
+                    builder_account TEXT NOT NULL,
+                    builder_name TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('queued','running','cancelling','cancelled','success','failed')),
+                    parameters_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    duration_seconds REAL,
+                    error_message TEXT,
+                    UNIQUE(job_id, build_number)
+                );
+                INSERT INTO builds(
+                    id, job_id, build_number, builder_account, builder_name, status,
+                    parameters_json, created_at, started_at, finished_at,
+                    duration_seconds, error_message
+                )
+                SELECT
+                    id, job_id, build_number, builder_account, builder_name, status,
+                    parameters_json, created_at, started_at, finished_at,
+                    duration_seconds, error_message
+                FROM builds_before_cancel_status;
+                DROP TABLE builds_before_cancel_status;
+                CREATE INDEX idx_builds_job_id ON builds(job_id, id DESC);
+                PRAGMA user_version = 3;
+                """
+            )
 
 
 def recover_interrupted_builds() -> None:
@@ -116,7 +157,7 @@ def recover_interrupted_builds() -> None:
         conn.execute(
             """UPDATE builds
                SET status='failed', finished_at=?, error_message='服务器重启，构建已中断'
-               WHERE status IN ('queued', 'running')""",
+               WHERE status IN ('queued', 'running', 'cancelling')""",
             (utc_now(),),
         )
 
@@ -430,6 +471,94 @@ class PipelineError(RuntimeError):
         self.status = status
 
 
+class BuildCancelled(RuntimeError):
+    """当前构建已收到用户终止请求。"""
+
+
+class BuildControl:
+    """保存单次构建的取消信号、当前子进程和 Jenkins 精确地址。"""
+
+    def __init__(self, build_id: int) -> None:
+        self.build_id = build_id
+        self.cancel_event = threading.Event()
+        self._lock = threading.Lock()
+        self._process: Optional[subprocess.Popen] = None
+        self._finished = False
+        self.requested_by_account = ""
+        self.requested_by_name = ""
+        self.jenkins_queue_url = ""
+        self.jenkins_build_url = ""
+
+    def request_cancel(self, user: Dict[str, Any]) -> Optional[bool]:
+        with self._lock:
+            if self._finished:
+                return None
+            first_request = not self.cancel_event.is_set()
+            if first_request:
+                self.requested_by_account = str(user["account"])
+                self.requested_by_name = str(user["name"])
+                self.cancel_event.set()
+            process = self._process
+        if process is not None:
+            _terminate_process_group(process)
+        return first_request
+
+    def attach_process(self, process: subprocess.Popen) -> None:
+        with self._lock:
+            self._process = process
+            cancel_requested = self.cancel_event.is_set()
+        if cancel_requested:
+            _terminate_process_group(process)
+
+    def detach_process(self, process: subprocess.Popen) -> None:
+        with self._lock:
+            if self._process is process:
+                self._process = None
+
+    def set_jenkins_queue_url(self, url: str) -> None:
+        with self._lock:
+            self.jenkins_queue_url = url
+
+    def set_jenkins_build_url(self, url: str) -> None:
+        with self._lock:
+            self.jenkins_build_url = url
+
+    def jenkins_urls(self) -> Tuple[str, str]:
+        with self._lock:
+            return self.jenkins_queue_url, self.jenkins_build_url
+
+    def is_cancel_requested(self) -> bool:
+        return self.cancel_event.is_set()
+
+    def raise_if_cancelled(self) -> None:
+        if self.cancel_event.is_set():
+            raise BuildCancelled("构建已由用户终止")
+
+    def wait(self, seconds: float) -> None:
+        if self.cancel_event.wait(seconds):
+            raise BuildCancelled("构建已由用户终止")
+
+    def mark_finished(self) -> bool:
+        with self._lock:
+            self._finished = True
+            self._process = None
+            return self.cancel_event.is_set()
+
+
+def _terminate_process_group(process: subprocess.Popen, force: bool = False) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
+        elif force:
+            process.kill()
+        else:
+            process.terminate()
+    except (ProcessLookupError, OSError):
+        pass
+
+
 class NoRedirectHandler(HTTPRedirectHandler):
     """保留 Jenkins 构建响应中的 Location，避免自动跳转后丢失队列地址。"""
 
@@ -475,6 +604,7 @@ def run_command(
     step: str,
     timeout: int,
     env: Optional[Dict[str, str]] = None,
+    cancellation: Optional[BuildControl] = None,
 ) -> None:
     display = shlex.join(command)
     is_git_command = bool(command) and command[0] == "git"
@@ -491,15 +621,57 @@ def run_command(
         except (OSError, TypeError):
             output_offset = 0
         try:
-            result = subprocess.run(
-                command,
-                cwd=str(cwd),
-                env=env,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                check=False,
-                timeout=timeout,
-            )
+            if cancellation is None:
+                result = subprocess.run(
+                    command,
+                    cwd=str(cwd),
+                    env=env,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                    timeout=timeout,
+                )
+            else:
+                cancellation.raise_if_cancelled()
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(cwd),
+                    env=env,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=(os.name == "posix"),
+                )
+                cancellation.attach_process(process)
+                deadline = time.monotonic() + timeout
+                try:
+                    while True:
+                        try:
+                            return_code = process.wait(timeout=0.2)
+                            break
+                        except subprocess.TimeoutExpired:
+                            cancellation.raise_if_cancelled()
+                            if time.monotonic() >= deadline:
+                                _terminate_process_group(process)
+                                try:
+                                    process.wait(timeout=LOCAL_CANCEL_GRACE_SECONDS)
+                                except subprocess.TimeoutExpired:
+                                    _terminate_process_group(process, force=True)
+                                    process.wait()
+                                raise subprocess.TimeoutExpired(command, timeout)
+                    cancellation.raise_if_cancelled()
+                    result = subprocess.CompletedProcess(command, return_code)
+                except BuildCancelled:
+                    log.write(f"[终止] 正在停止当前命令：{display}\n")
+                    log.flush()
+                    _terminate_process_group(process)
+                    try:
+                        process.wait(timeout=LOCAL_CANCEL_GRACE_SECONDS)
+                    except subprocess.TimeoutExpired:
+                        _terminate_process_group(process, force=True)
+                        process.wait()
+                    raise
+                finally:
+                    cancellation.detach_process(process)
         except FileNotFoundError as exc:
             raise PipelineError(f"{step}失败：找不到命令 {command[0]}") from exc
         except subprocess.TimeoutExpired as exc:
@@ -743,8 +915,14 @@ def jenkins_get_json(url: str) -> Dict[str, Any]:
     return payload
 
 
-def jenkins_status_json(url: str, log: TextIO) -> Dict[str, Any]:
+def jenkins_status_json(
+    url: str,
+    log: TextIO,
+    cancellation: Optional[BuildControl] = None,
+) -> Dict[str, Any]:
     for attempt in range(1, JENKINS_STATUS_RETRY_ATTEMPTS + 1):
+        if cancellation:
+            cancellation.raise_if_cancelled()
         try:
             return jenkins_get_json(url)
         except PipelineError as exc:
@@ -755,7 +933,10 @@ def jenkins_status_json(url: str, log: TextIO) -> Dict[str, Any]:
                 f"（{attempt}/{JENKINS_STATUS_RETRY_ATTEMPTS}）：{exc}\n"
             )
             log.flush()
-            time.sleep(JENKINS_POLL_INTERVAL_SECONDS)
+            if cancellation:
+                cancellation.wait(JENKINS_POLL_INTERVAL_SECONDS)
+            else:
+                time.sleep(JENKINS_POLL_INTERVAL_SECONDS)
     raise PipelineError("查询 Jenkins 构建状态失败")
 
 
@@ -766,10 +947,134 @@ def jenkins_instance_url(instance_url: str, returned_url: str) -> str:
     return candidate._replace(scheme=instance.scheme, netloc=instance.netloc).geturl()
 
 
+def _jenkins_root_url(url: str) -> str:
+    parsed = urlparse(url)
+    path_parts = [part for part in parsed.path.split("/") if part]
+    marker = next(
+        (index for index, part in enumerate(path_parts) if part in ("job", "view", "queue")),
+        len(path_parts),
+    )
+    context_path = "/" + "/".join(path_parts[:marker]) if marker else ""
+    return f"{parsed.scheme}://{parsed.netloc}{context_path}"
+
+
+def jenkins_post_action(url: str, log: TextIO, action: str) -> None:
+    headers = _jenkins_headers()
+    cookies = http.cookiejar.CookieJar()
+    opener = build_opener(HTTPCookieProcessor(cookies), NoRedirectHandler())
+    crumb_url = f"{_jenkins_root_url(url)}/crumbIssuer/api/json"
+    try:
+        with opener.open(Request(crumb_url, headers=headers), timeout=JENKINS_TIMEOUT_SECONDS) as response:
+            crumb = json.loads(response.read(64 * 1024).decode("utf-8"))
+            field = str(crumb.get("crumbRequestField", "")).strip()
+            value = str(crumb.get("crumb", "")).strip()
+            if field and value:
+                headers[field] = value
+    except HTTPError as exc:
+        if exc.code != HTTPStatus.NOT_FOUND:
+            raise PipelineError(
+                f"{action}失败，获取 Jenkins CSRF Token 时返回 HTTP {exc.code}：{_jenkins_error(exc)}",
+                HTTPStatus.BAD_GATEWAY,
+            ) from exc
+    except (URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise PipelineError(f"{action}失败，无法获取 Jenkins CSRF Token：{exc}") from exc
+
+    request = Request(
+        url,
+        data=b"",
+        headers={**headers, "Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with opener.open(request, timeout=JENKINS_TIMEOUT_SECONDS):
+            pass
+    except HTTPError as exc:
+        location = exc.headers.get("Location", "")
+        redirected = exc.code in (301, 302, 303, 307, 308) and "login" not in location.lower()
+        if not redirected:
+            raise PipelineError(
+                f"{action}失败（HTTP {exc.code}）：{_jenkins_error(exc)}",
+                HTTPStatus.BAD_GATEWAY,
+            ) from exc
+    except (URLError, TimeoutError) as exc:
+        raise PipelineError(f"{action}失败：{exc}", HTTPStatus.BAD_GATEWAY) from exc
+
+
+def stop_jenkins_build(build_url: str, log: TextIO) -> None:
+    stop_url = f"{build_url.rstrip('/')}/stop"
+    log.write(f"[终止] 请求 Jenkins 停止构建：{build_url}\n")
+    log.flush()
+    jenkins_post_action(stop_url, log, "停止 Jenkins 构建")
+
+    deadline = time.monotonic() + JENKINS_CANCEL_TIMEOUT_SECONDS
+    build_api = f"{build_url.rstrip('/')}/api/json?{urlencode({'tree': 'building,result'})}"
+    while time.monotonic() < deadline:
+        build_info = jenkins_status_json(build_api, log)
+        if not build_info.get("building"):
+            result = str(build_info.get("result") or "已停止").upper()
+            log.write(f"[终止] Jenkins 构建已结束，结果：{result}\n")
+            log.flush()
+            return
+        time.sleep(JENKINS_POLL_INTERVAL_SECONDS)
+    raise PipelineError(
+        f"已请求停止 Jenkins 构建，但 {JENKINS_CANCEL_TIMEOUT_SECONDS} 秒内未确认结束"
+    )
+
+
+def cancel_jenkins_queue(queue_url: str, log: TextIO) -> None:
+    queue_parts = [part for part in urlparse(queue_url).path.split("/") if part]
+    try:
+        queue_index = queue_parts.index("queue")
+        queue_id = queue_parts[queue_index + 2]
+    except (ValueError, IndexError):
+        raise PipelineError(f"无法从 Jenkins 队列地址中识别队列编号：{queue_url}")
+
+    queue_api = f"{queue_url.rstrip('/')}/api/json?{urlencode({'tree': 'cancelled,executable[number,url]'})}"
+    queue_info = jenkins_get_json(queue_api)
+    executable = queue_info.get("executable")
+    if isinstance(executable, dict) and executable.get("url"):
+        stop_jenkins_build(
+            jenkins_instance_url(queue_url, str(executable["url"])), log
+        )
+        return
+    if queue_info.get("cancelled"):
+        log.write("[终止] Jenkins 队列任务已经取消\n")
+        log.flush()
+        return
+
+    cancel_url = f"{_jenkins_root_url(queue_url)}/queue/cancelItem?{urlencode({'id': queue_id})}"
+    log.write(f"[终止] 请求 Jenkins 取消队列任务：{queue_url}\n")
+    log.flush()
+    try:
+        jenkins_post_action(cancel_url, log, "取消 Jenkins 队列任务")
+    except PipelineError:
+        latest = jenkins_get_json(queue_api)
+        executable = latest.get("executable")
+        if isinstance(executable, dict) and executable.get("url"):
+            stop_jenkins_build(
+                jenkins_instance_url(queue_url, str(executable["url"])), log
+            )
+            return
+        if latest.get("cancelled"):
+            return
+        raise
+    log.write("[终止] Jenkins 队列取消请求已受理\n")
+    log.flush()
+
+
+def cancel_remote_jenkins(control: BuildControl, log: TextIO) -> None:
+    queue_url, build_url = control.jenkins_urls()
+    if build_url:
+        stop_jenkins_build(build_url, log)
+    elif queue_url:
+        cancel_jenkins_queue(queue_url, log)
+
+
 def wait_for_jenkins(
     queue_url: str,
     log: TextIO,
     on_started: Optional[Callable[[Dict[str, Any]], None]] = None,
+    cancellation: Optional[BuildControl] = None,
 ) -> Dict[str, Any]:
     if not queue_url:
         raise PipelineError("Jenkins 未返回队列地址，无法跟踪构建结果", HTTPStatus.BAD_GATEWAY)
@@ -782,7 +1087,7 @@ def wait_for_jenkins(
     log.write("[Jenkins] 等待任务离开队列…\n")
     log.flush()
     while time.monotonic() < deadline:
-        queue_info = jenkins_status_json(queue_api, log)
+        queue_info = jenkins_status_json(queue_api, log, cancellation)
         if queue_info.get("cancelled"):
             raise PipelineError("Jenkins 队列任务已取消")
         executable = queue_info.get("executable")
@@ -805,7 +1110,10 @@ def wait_for_jenkins(
             log.write(f"[Jenkins] {wait_reason}\n")
             log.flush()
             last_wait_reason = wait_reason
-        time.sleep(JENKINS_POLL_INTERVAL_SECONDS)
+        if cancellation:
+            cancellation.wait(JENKINS_POLL_INTERVAL_SECONDS)
+        else:
+            time.sleep(JENKINS_POLL_INTERVAL_SECONDS)
     if not build_url:
         raise PipelineError(f"等待 Jenkins 任务进入构建阶段超时（{JENKINS_BUILD_TIMEOUT_SECONDS} 秒）")
 
@@ -813,7 +1121,7 @@ def wait_for_jenkins(
     log.flush()
     build_api = f"{build_url.rstrip('/')}/api/json?{urlencode({'tree': 'number,url,building,result,duration'})}"
     while time.monotonic() < deadline:
-        build_info = jenkins_status_json(build_api, log)
+        build_info = jenkins_status_json(build_api, log, cancellation)
         result = str(build_info.get("result") or "").upper()
         if not build_info.get("building") and result:
             duration_ms = build_info.get("duration")
@@ -831,7 +1139,10 @@ def wait_for_jenkins(
                 "jenkins_result": result,
                 "jenkins_duration_seconds": jenkins_duration,
             }
-        time.sleep(JENKINS_POLL_INTERVAL_SECONDS)
+        if cancellation:
+            cancellation.wait(JENKINS_POLL_INTERVAL_SECONDS)
+        else:
+            time.sleep(JENKINS_POLL_INTERVAL_SECONDS)
     raise PipelineError(f"等待 Jenkins 构建结束超时（{JENKINS_BUILD_TIMEOUT_SECONDS} 秒）")
 
 
@@ -841,6 +1152,7 @@ def execute_build_pipeline(
     note: str,
     builder_name: str,
     log: TextIO,
+    cancellation: Optional[BuildControl] = None,
 ) -> str:
     project_root = Path(config["project_root"])
     branch = str(config["branch"])
@@ -863,10 +1175,25 @@ def execute_build_pipeline(
 
     command_env = os.environ.copy()
     command_env["GIT_TERMINAL_PROMPT"] = "0"
+    def run_pipeline_command(
+        command: List[str],
+        cwd: Path,
+        command_log: TextIO,
+        step: str,
+        timeout: int,
+        env: Optional[Dict[str, str]] = None,
+    ) -> None:
+        run_command(
+            command, cwd, command_log, step, timeout, env,
+            cancellation=cancellation,
+        )
+
+    if cancellation:
+        cancellation.raise_if_cancelled()
     log.write(f"[资源仓库] 清理并更新 {resource_branch} 分支\n")
     log.flush()
     clear_stale_git_index_locks(resource_repo_root, log)
-    run_command(
+    run_pipeline_command(
         ["git", "reset", "--hard"],
         resource_repo_root,
         log,
@@ -874,7 +1201,7 @@ def execute_build_pipeline(
         GIT_TIMEOUT_SECONDS,
         command_env,
     )
-    run_command(
+    run_pipeline_command(
         ["git", "clean", "-fd"],
         resource_repo_root,
         log,
@@ -882,7 +1209,7 @@ def execute_build_pipeline(
         GIT_TIMEOUT_SECONDS,
         command_env,
     )
-    run_command(
+    run_pipeline_command(
         ["git", "fetch", "origin", resource_branch],
         resource_repo_root,
         log,
@@ -890,7 +1217,7 @@ def execute_build_pipeline(
         GIT_TIMEOUT_SECONDS,
         command_env,
     )
-    run_command(
+    run_pipeline_command(
         ["git", "checkout", "-B", resource_branch, f"origin/{resource_branch}"],
         resource_repo_root,
         log,
@@ -898,7 +1225,7 @@ def execute_build_pipeline(
         GIT_TIMEOUT_SECONDS,
         command_env,
     )
-    run_command(
+    run_pipeline_command(
         ["git", "pull", "--ff-only", "origin", resource_branch],
         resource_repo_root,
         log,
@@ -910,17 +1237,17 @@ def execute_build_pipeline(
     log.write(f"[客户端仓库] 清理并更新 {branch} 分支\n")
     log.flush()
     clear_stale_git_index_locks(project_root, log)
-    run_command(["git", "reset", "--hard"], project_root, log, "清理本地修改", GIT_TIMEOUT_SECONDS, command_env)
-    run_command(["git", "clean", "-fd"], project_root, log, "清理未跟踪文件", GIT_TIMEOUT_SECONDS, command_env)
-    run_command(["git", "submodule", "foreach", "--recursive", "git reset --hard"], project_root, log, "清理子模块本地修改", GIT_TIMEOUT_SECONDS, command_env)
-    run_command(["git", "submodule", "foreach", "--recursive", "git clean -fd"], project_root, log, "清理子模块未跟踪文件", GIT_TIMEOUT_SECONDS, command_env)
-    run_command(["git", "fetch", "origin", branch], project_root, log, "拉取远端分支", GIT_TIMEOUT_SECONDS, command_env)
-    run_command(["git", "checkout", "-B", branch, f"origin/{branch}"], project_root, log, "切换主分支", GIT_TIMEOUT_SECONDS, command_env)
-    run_command(["git", "pull", "--ff-only", "origin", branch], project_root, log, "更新主分支", GIT_TIMEOUT_SECONDS, command_env)
-    run_command(["git", "submodule", "sync", "--recursive"], project_root, log, "同步子模块配置", GIT_TIMEOUT_SECONDS, command_env)
-    run_command(["git", "submodule", "update", "--init", "--recursive", "--force"], project_root, log, "更新子模块", GIT_TIMEOUT_SECONDS, command_env)
-    run_command(["git", "submodule", "foreach", "--recursive", "git reset --hard"], project_root, log, "确认子模块无本地修改", GIT_TIMEOUT_SECONDS, command_env)
-    run_command(["git", "submodule", "foreach", "--recursive", "git clean -fd"], project_root, log, "确认子模块无未跟踪文件", GIT_TIMEOUT_SECONDS, command_env)
+    run_pipeline_command(["git", "reset", "--hard"], project_root, log, "清理本地修改", GIT_TIMEOUT_SECONDS, command_env)
+    run_pipeline_command(["git", "clean", "-fd"], project_root, log, "清理未跟踪文件", GIT_TIMEOUT_SECONDS, command_env)
+    run_pipeline_command(["git", "submodule", "foreach", "--recursive", "git reset --hard"], project_root, log, "清理子模块本地修改", GIT_TIMEOUT_SECONDS, command_env)
+    run_pipeline_command(["git", "submodule", "foreach", "--recursive", "git clean -fd"], project_root, log, "清理子模块未跟踪文件", GIT_TIMEOUT_SECONDS, command_env)
+    run_pipeline_command(["git", "fetch", "origin", branch], project_root, log, "拉取远端分支", GIT_TIMEOUT_SECONDS, command_env)
+    run_pipeline_command(["git", "checkout", "-B", branch, f"origin/{branch}"], project_root, log, "切换主分支", GIT_TIMEOUT_SECONDS, command_env)
+    run_pipeline_command(["git", "pull", "--ff-only", "origin", branch], project_root, log, "更新主分支", GIT_TIMEOUT_SECONDS, command_env)
+    run_pipeline_command(["git", "submodule", "sync", "--recursive"], project_root, log, "同步子模块配置", GIT_TIMEOUT_SECONDS, command_env)
+    run_pipeline_command(["git", "submodule", "update", "--init", "--recursive", "--force"], project_root, log, "更新子模块", GIT_TIMEOUT_SECONDS, command_env)
+    run_pipeline_command(["git", "submodule", "foreach", "--recursive", "git reset --hard"], project_root, log, "确认子模块无本地修改", GIT_TIMEOUT_SECONDS, command_env)
+    run_pipeline_command(["git", "submodule", "foreach", "--recursive", "git clean -fd"], project_root, log, "确认子模块无未跟踪文件", GIT_TIMEOUT_SECONDS, command_env)
 
     compile_command = ["coffee", "compile.coffee", "res"]
     for resource_path in resource_paths:
@@ -929,12 +1256,12 @@ def execute_build_pipeline(
     node_options = compile_env.get("NODE_OPTIONS", "").strip()
     compat_option = f"--require={NODE_STDOUT_COMPAT_PATH}"
     compile_env["NODE_OPTIONS"] = " ".join(filter(None, (node_options, compat_option)))
-    run_command(compile_command, project_root, log, "资源编译", COMPILE_TIMEOUT_SECONDS, compile_env)
+    run_pipeline_command(compile_command, project_root, log, "资源编译", COMPILE_TIMEOUT_SECONDS, compile_env)
 
-    run_command(["git", "add", "-A"], project_root, log, "暂存资源修改", GIT_TIMEOUT_SECONDS, command_env)
+    run_pipeline_command(["git", "add", "-A"], project_root, log, "暂存资源修改", GIT_TIMEOUT_SECONDS, command_env)
     commit_message = f"res:{note}" if note else "res"
     commit_author = f"relay_ota({builder_name}) <{GIT_COMMIT_AUTHOR_EMAIL}>"
-    run_command(
+    run_pipeline_command(
         ["git", "commit", "--author", commit_author, "-m", commit_message],
         project_root,
         log,
@@ -942,7 +1269,9 @@ def execute_build_pipeline(
         GIT_TIMEOUT_SECONDS,
         command_env,
     )
-    run_command(["git", "push", "origin", f"HEAD:{branch}"], project_root, log, "推送资源修改", GIT_TIMEOUT_SECONDS, command_env)
+    run_pipeline_command(["git", "push", "origin", f"HEAD:{branch}"], project_root, log, "推送资源修改", GIT_TIMEOUT_SECONDS, command_env)
+    if cancellation:
+        cancellation.raise_if_cancelled()
     return trigger_jenkins(config, log)
 
 
@@ -1017,6 +1346,16 @@ def finish_build(build_id: int, status: str, duration_seconds: float, error_mess
         )
 
 
+def mark_build_cancelling(build_id: int) -> bool:
+    with connect_db() as conn:
+        cursor = conn.execute(
+            """UPDATE builds SET status='cancelling'
+               WHERE id=? AND status IN ('queued', 'running')""",
+            (build_id,),
+        )
+    return cursor.rowcount > 0
+
+
 class BuildManager:
     """串行执行共享工作区上的构建，并在后台跟踪 Jenkins 最终结果。"""
 
@@ -1024,32 +1363,80 @@ class BuildManager:
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ota-build")
         self._lock = threading.Lock()
         self._pending: List[int] = []
+        self._controls: Dict[int, BuildControl] = {}
+        self._futures: Dict[int, Any] = {}
 
     def enqueue(self, build_id: int) -> Dict[str, Any]:
+        control = BuildControl(build_id)
         with self._lock:
             starts_immediately = not self._pending
             self._pending.append(build_id)
+            self._controls[build_id] = control
             if starts_immediately:
                 mark_build_running(build_id)
             try:
-                self._executor.submit(self._run, build_id)
+                self._futures[build_id] = self._executor.submit(
+                    self._run, build_id, control
+                )
             except Exception:
                 self._pending.remove(build_id)
+                self._controls.pop(build_id, None)
                 raise
         build = get_build_record(build_id)
         assert build is not None
         return build
 
+    def cancel(self, build_id: int, user: Dict[str, Any]) -> Dict[str, Any]:
+        build = get_build_record(build_id)
+        if not build:
+            raise PipelineError("构建记录不存在", HTTPStatus.NOT_FOUND)
+        if build["status"] == "cancelled":
+            return build
+        if build["status"] in ("success", "failed"):
+            raise PipelineError("构建已经结束，无法终止", HTTPStatus.CONFLICT)
+
+        with self._lock:
+            control = self._controls.get(build_id)
+            future = self._futures.get(build_id)
+            if not control or not future:
+                raise PipelineError("构建任务已不在运行队列中", HTTPStatus.CONFLICT)
+            cancellation_state = control.request_cancel(user)
+            if cancellation_state is None:
+                raise PipelineError("构建正在结束，无法再终止", HTTPStatus.CONFLICT)
+            cancelled_before_start = future.cancel()
+
+        mark_build_cancelling(build_id)
+        if cancelled_before_start:
+            log_path = LOG_DIR / f"build-{build_id}.log"
+            with log_path.open("a", encoding="utf-8") as log:
+                log.write(
+                    f"[{utc_now()}] [终止] {user['name']}（{user['account']}）"
+                    "终止了尚未开始执行的构建\n"
+                )
+            finish_build(build_id, "cancelled", 0, None)
+            control.mark_finished()
+            with self._lock:
+                if build_id in self._pending:
+                    self._pending.remove(build_id)
+                self._controls.pop(build_id, None)
+                self._futures.pop(build_id, None)
+
+        result = get_build_record(build_id)
+        assert result is not None
+        return result
+
     def shutdown(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
 
-    def _run(self, build_id: int) -> None:
+    def _run(self, build_id: int, control: BuildControl) -> None:
         start_clock = time.monotonic()
         error_message: Optional[str] = None
         status = "failed"
+        cancelled = False
         log_path = LOG_DIR / f"build-{build_id}.log"
         try:
             mark_build_running(build_id)
+            control.raise_if_cancelled()
             build = get_build_record(build_id)
             if not build:
                 raise PipelineError("本地构建记录不存在")
@@ -1062,16 +1449,30 @@ class BuildManager:
                 log.write(json.dumps(parameters, ensure_ascii=False, indent=2) + "\n")
                 log.flush()
                 queue_url = execute_build_pipeline(
-                    config, resource_paths, note, str(build["builder_name"]), log
+                    config,
+                    resource_paths,
+                    note,
+                    str(build["builder_name"]),
+                    log,
+                    cancellation=control,
                 )
+                control.set_jenkins_queue_url(queue_url)
                 parameters["jenkins_queue_url"] = queue_url
                 update_build_parameters(build_id, parameters)
+                control.raise_if_cancelled()
 
                 def record_jenkins_start(details: Dict[str, Any]) -> None:
+                    control.set_jenkins_build_url(str(details.get("jenkins_build_url") or ""))
                     parameters.update(details)
                     update_build_parameters(build_id, parameters)
 
-                jenkins_details = wait_for_jenkins(queue_url, log, record_jenkins_start)
+                jenkins_details = wait_for_jenkins(
+                    queue_url,
+                    log,
+                    record_jenkins_start,
+                    cancellation=control,
+                )
+                control.raise_if_cancelled()
                 parameters.update(jenkins_details)
                 update_build_parameters(build_id, parameters)
                 if jenkins_details["jenkins_result"] != "SUCCESS":
@@ -1081,11 +1482,37 @@ class BuildManager:
                 log.write("\n[完成] 资源已提交，Jenkins OTA 构建成功\n")
                 log.flush()
                 status = "success"
+        except BuildCancelled:
+            cancelled = True
         except PipelineError as exc:
-            error_message = str(exc)
+            if control.is_cancel_requested():
+                cancelled = True
+            else:
+                error_message = str(exc)
         except Exception as exc:
-            error_message = f"构建服务内部错误：{type(exc).__name__}: {exc}"
+            if control.is_cancel_requested():
+                cancelled = True
+            else:
+                error_message = f"构建服务内部错误：{type(exc).__name__}: {exc}"
         finally:
+            cancelled = control.mark_finished() or cancelled
+            if cancelled:
+                try:
+                    with log_path.open("a", encoding="utf-8") as log:
+                        log.write(
+                            f"\n[{utc_now()}] [终止] "
+                            f"{control.requested_by_name}（{control.requested_by_account}）"
+                            "请求终止构建\n"
+                        )
+                        log.write("[终止] 已执行的 Git 操作将原样保留，不执行回滚或清理\n")
+                        log.flush()
+                        cancel_remote_jenkins(control, log)
+                        log.write("[终止] 构建已终止\n")
+                    status = "cancelled"
+                    error_message = None
+                except PipelineError as exc:
+                    error_message = f"终止构建失败：{exc}"
+                    status = "failed"
             if error_message:
                 try:
                     with log_path.open("a", encoding="utf-8") as log:
@@ -1101,6 +1528,8 @@ class BuildManager:
             with self._lock:
                 if build_id in self._pending:
                     self._pending.remove(build_id)
+                self._controls.pop(build_id, None)
+                self._futures.pop(build_id, None)
 
 
 JOBS: Dict[str, Dict[str, Any]] = {}
@@ -1214,6 +1643,13 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._login(payload)
             elif path == "/api/logout":
                 self._logout()
+            elif path.startswith("/api/builds/") and path.endswith("/cancel"):
+                user = self._require_user()
+                parts = path.strip("/").split("/")
+                if user and len(parts) == 4 and parts[2].isdigit():
+                    self._cancel_build(int(parts[2]), user)
+                elif user:
+                    self._error(HTTPStatus.NOT_FOUND, "接口不存在")
             elif path.startswith("/api/jobs/") and path.endswith("/builds"):
                 user = self._require_user()
                 if user:
@@ -1349,6 +1785,15 @@ class AppHandler(BaseHTTPRequestHandler):
         log_path = LOG_DIR / f"build-{build_id}.log"
         content = log_path.read_text(encoding="utf-8", errors="replace")[-100_000:] if log_path.exists() else "暂无日志"
         self._json(HTTPStatus.OK, {"log": content})
+
+    def _cancel_build(self, build_id: int, user: Dict[str, Any]) -> None:
+        assert BUILD_MANAGER is not None
+        try:
+            build = BUILD_MANAGER.cancel(build_id, user)
+        except PipelineError as exc:
+            self._error(exc.status, str(exc))
+            return
+        self._json(HTTPStatus.ACCEPTED, {"build": build})
 
     def _create_build(self, job_id: str, payload: Dict[str, Any], user: Dict[str, Any]) -> None:
         if job_id not in JOBS:

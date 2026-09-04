@@ -70,6 +70,20 @@
 
     <div id="drawer-backdrop" class="drawer-backdrop hidden"></div>
     <aside id="build-drawer" class="build-drawer" aria-hidden="true"></aside>
+    <dialog id="cancel-build-dialog" class="cancel-build-dialog" aria-labelledby="cancel-build-title">
+      <div class="cancel-dialog-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="1"/></svg>
+      </div>
+      <div class="cancel-dialog-copy">
+        <p>TERMINATE BUILD</p>
+        <h2 id="cancel-build-title">确认终止构建 <span id="cancel-build-number"></span>？</h2>
+        <div class="cancel-dialog-warning">当前脚本或 Jenkins OTA 将被停止。已经执行的 Git 操作会原样保留，不会回滚或清理。</div>
+      </div>
+      <div class="cancel-dialog-actions">
+        <button class="button secondary" type="button" data-cancel-dialog-close>继续构建</button>
+        <button id="cancel-build-confirm" class="button danger" type="button">确认终止</button>
+      </div>
+    </dialog>
     <script src="/app.js" defer></script>
   </body>
 </html>
