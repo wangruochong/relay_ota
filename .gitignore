@@ -1,5 +1,4 @@
 data/
-config/accounts.json
 __pycache__/
 *.pyc
 .DS_Store

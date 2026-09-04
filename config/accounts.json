@@ -1,0 +1,10 @@
+{
+  "accounts": [
+    {
+      "account": "wangruochong",
+      "name": "王若冲",
+      "password": "88888888",
+      "enabled": true
+    }
+  ]
+}
