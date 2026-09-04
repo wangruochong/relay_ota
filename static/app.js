@@ -457,6 +457,11 @@ function startPolling() {
       const selectedId = Number(drawer.dataset.buildId);
       const selected = state.builds.find(build => build.id === selectedId);
       const statusChanged = selected && drawer.dataset.buildStatus !== selected.status;
+      const otaVersionChanged = selected
+        && drawer.dataset.otaVersion !== String(selected.parameters.jenkins_build_number ?? "");
+      if (otaVersionChanged) {
+        updateDrawerOtaVersion(selected);
+      }
       if (selected && statusChanged && !drawerHasTextSelection(drawer)) {
         updateDrawerSummary(selected);
       }
@@ -540,11 +545,21 @@ function renderDrawer(build) {
   const drawer = document.querySelector("#build-drawer");
   if (Number(drawer.dataset.buildId) !== build.id) return;
   drawer.dataset.buildStatus = build.status;
+  drawer.dataset.otaVersion = String(build.parameters.jenkins_build_number ?? "");
   drawer.innerHTML = `<div class="drawer-top"><div><p>BUILD DETAILS</p><h2>#${build.build_number} 构建详情</h2></div><button class="icon-button drawer-close" aria-label="关闭">${icons.failed}</button></div>
     <div class="drawer-status">${drawerStatusHTML(build)}</div>
     <section class="detail-section"><h3>基础信息</h3><dl class="detail-grid"><div class="detail-row"><dt>构建项目</dt><dd>${escapeHTML(build.job_id.toUpperCase())}</dd></div><div class="detail-row"><dt>构建者</dt><dd>${escapeHTML(build.builder_name)}</dd></div><div class="detail-row"><dt>登录账号</dt><dd>${escapeHTML(build.builder_account)}</dd></div><div class="detail-row"><dt>提交时间</dt><dd>${formatDate(build.created_at)}</dd></div><div class="detail-row"><dt>开始时间</dt><dd data-drawer-field="started-at">${formatDate(build.started_at)}</dd></div><div class="detail-row"><dt>完成时间</dt><dd data-drawer-field="finished-at">${formatDate(build.finished_at)}</dd></div><div class="detail-row failure-reason${build.error_message ? "" : " hidden"}" data-drawer-failure><dt>失败原因</dt><dd>${escapeHTML(build.error_message || "")}</dd></div><div class="detail-row"><dt>OTA 版本号</dt><dd data-drawer-field="ota-version">${escapeHTML(build.parameters.jenkins_build_number ?? "—")}</dd></div></dl></section>
     <section class="detail-section"><h3>构建参数</h3><dl class="detail-grid"><div class="detail-row"><dt>资源路径</dt><dd><span class="detail-paths">${(build.parameters.resource_paths || []).map(path => `<span class="detail-path">${escapeHTML(path)}</span>`).join("")}</span></dd></div><div class="detail-row"><dt>构建说明</dt><dd>${escapeHTML(build.parameters.note || "—")}</dd></div></dl></section>
     <section class="detail-section"><h3>构建日志</h3><pre id="build-log" class="log-box">正在加载日志…</pre></section>`;
+}
+
+function updateDrawerOtaVersion(build) {
+  const drawer = document.querySelector("#build-drawer");
+  if (Number(drawer.dataset.buildId) !== build.id) return;
+  const otaVersion = build.parameters.jenkins_build_number ?? "";
+  const otaVersionNode = drawer.querySelector('[data-drawer-field="ota-version"]');
+  if (otaVersionNode) otaVersionNode.textContent = otaVersion === "" ? "—" : String(otaVersion);
+  drawer.dataset.otaVersion = String(otaVersion);
 }
 
 function updateDrawerSummary(build) {
@@ -555,10 +570,9 @@ function updateDrawerSummary(build) {
   if (statusRoot) statusRoot.innerHTML = drawerStatusHTML(build);
   const startedAt = drawer.querySelector('[data-drawer-field="started-at"]');
   const finishedAt = drawer.querySelector('[data-drawer-field="finished-at"]');
-  const otaVersion = drawer.querySelector('[data-drawer-field="ota-version"]');
   if (startedAt) startedAt.textContent = formatDate(build.started_at);
   if (finishedAt) finishedAt.textContent = formatDate(build.finished_at);
-  if (otaVersion) otaVersion.textContent = build.parameters.jenkins_build_number ?? "—";
+  updateDrawerOtaVersion(build);
   const failure = drawer.querySelector("[data-drawer-failure]");
   if (failure) {
     failure.classList.toggle("hidden", !build.error_message);
@@ -598,6 +612,7 @@ function closeDrawer() {
   drawer.setAttribute("aria-hidden", "true");
   drawer.dataset.buildId = "";
   drawer.dataset.buildStatus = "";
+  drawer.dataset.otaVersion = "";
   document.querySelector("#drawer-backdrop").classList.add("hidden");
 }
 
