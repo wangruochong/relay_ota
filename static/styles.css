@@ -39,10 +39,8 @@ svg { fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round
 .login-brand::after { content: ""; position: absolute; width: 220px; height: 220px; bottom: -110px; left: -90px; border: 60px solid rgba(204,232,91,.07); transform: rotate(24deg); }
 .brand-mark { width: 36px; height: 36px; display: inline-grid; place-items: center; color: #0b2c26; background: var(--lime); border-radius: 10px; box-shadow: 0 5px 12px rgba(95,126,22,.15); }
 .brand-mark svg { width: 27px; height: 27px; stroke-width: 2.5; }
-.brand-mark-large { width: 54px; height: 54px; border-radius: 15px; margin-bottom: 54px; }
-.brand-mark-large svg { width: 38px; height: 38px; }
 .eyebrow { margin: 0 0 16px; color: var(--green); font-size: 11px; font-weight: 750; letter-spacing: .18em; }
-.eyebrow.light { color: var(--lime); }
+.eyebrow.light { margin-bottom: 22px; color: var(--lime); font-size: 14px; letter-spacing: .16em; }
 .login-brand h1 { position: relative; z-index: 1; margin: 0; font-family: Georgia, "Songti SC", serif; font-size: clamp(43px, 4.3vw, 70px); line-height: 1.15; letter-spacing: -.035em; font-weight: 500; }
 .login-copy { position: relative; z-index: 1; max-width: 530px; margin: 34px 0 55px; color: #adbfba; font-size: 16px; line-height: 1.8; }
 .login-feature-list { position: relative; z-index: 1; display: flex; gap: 34px; }
