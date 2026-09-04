@@ -80,14 +80,15 @@ function showLogin() {
   state.user = null;
   document.querySelector("#app-view").classList.add("hidden");
   document.querySelector("#login-view").classList.remove("hidden");
-  window.setTimeout(() => document.querySelector("#username")?.focus(), 30);
+  window.setTimeout(() => document.querySelector("#account")?.focus(), 30);
 }
 
 function showApp() {
   document.querySelector("#login-view").classList.add("hidden");
   document.querySelector("#app-view").classList.remove("hidden");
-  document.querySelector("#user-name").textContent = state.user.username;
-  document.querySelector("#user-avatar").textContent = state.user.username.slice(0, 1).toUpperCase();
+  document.querySelector("#user-name").textContent = state.user.name;
+  document.querySelector("#user-name").title = `登录账号：${state.user.account}`;
+  document.querySelector("#user-avatar").textContent = state.user.name.slice(0, 1).toUpperCase();
   route();
 }
 
@@ -382,14 +383,14 @@ function showPathRequiredHighlight() {
 function buildListItem(build) {
   const status = statusMap[build.status] || statusMap.queued;
   const highlighted = state.highlightedBuildPending && state.highlightedBuildId === build.id ? " build-item-new" : "";
-  return `<button class="build-item${highlighted}" data-build-id="${build.id}">${statusHTML(build.status, true)}<span><span class="build-primary"><b>#${build.build_number}</b><span class="status-badge ${build.status}">${status.label}</span></span><span class="build-meta"><span>${escapeHTML(build.username)}</span><span>${relativeTime(build.created_at)}</span></span></span><span class="build-arrow">${icons.chevron}</span></button>`;
+  return `<button class="build-item${highlighted}" data-build-id="${build.id}">${statusHTML(build.status, true)}<span><span class="build-primary"><b>#${build.build_number}</b><span class="status-badge ${build.status}">${status.label}</span></span><span class="build-meta"><span>${escapeHTML(build.builder_name)}</span><span>${relativeTime(build.created_at)}</span></span></span><span class="build-arrow">${icons.chevron}</span></button>`;
 }
 
 function renderBuildList() {
   const root = document.querySelector("#build-list");
   if (!root) return;
   const needle = state.buildFilter.toLowerCase();
-  const builds = state.builds.filter(build => `#${build.build_number} ${build.username}`.toLowerCase().includes(needle));
+  const builds = state.builds.filter(build => `#${build.build_number} ${build.builder_name} ${build.builder_account}`.toLowerCase().includes(needle));
   document.querySelector("#build-count").textContent = state.builds.length;
   root.innerHTML = builds.length ? `<div class="date-separator">最近构建</div>${builds.map(buildListItem).join("")}` : '<div class="empty-state">暂无匹配的构建记录</div>';
   if (state.highlightedBuildPending && root.querySelector(`[data-build-id="${state.highlightedBuildId}"]`)) {
@@ -402,7 +403,8 @@ function buildListSignature(builds) {
     build.id,
     build.build_number,
     build.status,
-    build.username,
+    build.builder_account,
+    build.builder_name,
     build.created_at,
   ].join(":")).join("|");
 }
@@ -540,7 +542,7 @@ function renderDrawer(build) {
   drawer.dataset.buildStatus = build.status;
   drawer.innerHTML = `<div class="drawer-top"><div><p>BUILD DETAILS</p><h2>#${build.build_number} 构建详情</h2></div><button class="icon-button drawer-close" aria-label="关闭">${icons.failed}</button></div>
     <div class="drawer-status">${drawerStatusHTML(build)}</div>
-    <section class="detail-section"><h3>基础信息</h3><dl class="detail-grid"><div class="detail-row"><dt>构建项目</dt><dd>${escapeHTML(build.job_id.toUpperCase())}</dd></div><div class="detail-row"><dt>构建者</dt><dd>${escapeHTML(build.username)}</dd></div><div class="detail-row"><dt>提交时间</dt><dd>${formatDate(build.created_at)}</dd></div><div class="detail-row"><dt>开始时间</dt><dd data-drawer-field="started-at">${formatDate(build.started_at)}</dd></div><div class="detail-row"><dt>完成时间</dt><dd data-drawer-field="finished-at">${formatDate(build.finished_at)}</dd></div><div class="detail-row failure-reason${build.error_message ? "" : " hidden"}" data-drawer-failure><dt>失败原因</dt><dd>${escapeHTML(build.error_message || "")}</dd></div><div class="detail-row"><dt>OTA 版本号</dt><dd data-drawer-field="ota-version">${escapeHTML(build.parameters.jenkins_build_number ?? "—")}</dd></div></dl></section>
+    <section class="detail-section"><h3>基础信息</h3><dl class="detail-grid"><div class="detail-row"><dt>构建项目</dt><dd>${escapeHTML(build.job_id.toUpperCase())}</dd></div><div class="detail-row"><dt>构建者</dt><dd>${escapeHTML(build.builder_name)}</dd></div><div class="detail-row"><dt>登录账号</dt><dd>${escapeHTML(build.builder_account)}</dd></div><div class="detail-row"><dt>提交时间</dt><dd>${formatDate(build.created_at)}</dd></div><div class="detail-row"><dt>开始时间</dt><dd data-drawer-field="started-at">${formatDate(build.started_at)}</dd></div><div class="detail-row"><dt>完成时间</dt><dd data-drawer-field="finished-at">${formatDate(build.finished_at)}</dd></div><div class="detail-row failure-reason${build.error_message ? "" : " hidden"}" data-drawer-failure><dt>失败原因</dt><dd>${escapeHTML(build.error_message || "")}</dd></div><div class="detail-row"><dt>OTA 版本号</dt><dd data-drawer-field="ota-version">${escapeHTML(build.parameters.jenkins_build_number ?? "—")}</dd></div></dl></section>
     <section class="detail-section"><h3>构建参数</h3><dl class="detail-grid"><div class="detail-row"><dt>资源路径</dt><dd><span class="detail-paths">${(build.parameters.resource_paths || []).map(path => `<span class="detail-path">${escapeHTML(path)}</span>`).join("")}</span></dd></div><div class="detail-row"><dt>构建说明</dt><dd>${escapeHTML(build.parameters.note || "—")}</dd></div></dl></section>
     <section class="detail-section"><h3>构建日志</h3><pre id="build-log" class="log-box">正在加载日志…</pre></section>`;
 }
@@ -609,7 +611,7 @@ document.addEventListener("submit", event => {
     button.textContent = "正在登录…";
     api("/api/login", {
       method: "POST",
-      body: JSON.stringify({ username: event.target.username.value, password: event.target.password.value }),
+      body: JSON.stringify({ account: event.target.account.value, password: event.target.password.value }),
     }).then(payload => {
       state.user = payload.user;
       event.target.password.value = "";

@@ -19,6 +19,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+import unicodedata
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.cookies import SimpleCookie
@@ -38,13 +39,14 @@ from urllib.request import (
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 RES_DIR = BASE_DIR / "res"
+CONFIG_DIR = BASE_DIR / "config"
+ACCOUNTS_PATH = CONFIG_DIR / "accounts.json"
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "ota_tool.db"
 LOG_DIR = DATA_DIR / "logs"
 CONFIG_PATH = BASE_DIR / "jobs.json"
 SESSION_COOKIE = "ota_session"
 SESSION_TTL_SECONDS = 12 * 60 * 60
-PASSWORD_ITERATIONS = 310_000
 GIT_TIMEOUT_SECONDS = 300
 COMPILE_TIMEOUT_SECONDS = 60 * 60
 JENKINS_TIMEOUT_SECONDS = 30
@@ -76,17 +78,10 @@ def init_db() -> None:
     with connect_db() as conn:
         conn.executescript(
             """
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                password_hash TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                disabled INTEGER NOT NULL DEFAULT 0
-            );
-
             CREATE TABLE IF NOT EXISTS sessions (
                 token_hash TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                account TEXT NOT NULL,
+                account_revision TEXT NOT NULL,
                 expires_at INTEGER NOT NULL,
                 created_at TEXT NOT NULL
             );
@@ -95,7 +90,8 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 job_id TEXT NOT NULL,
                 build_number INTEGER NOT NULL,
-                user_id INTEGER NOT NULL REFERENCES users(id),
+                builder_account TEXT NOT NULL,
+                builder_name TEXT NOT NULL,
                 status TEXT NOT NULL CHECK(status IN ('queued','running','success','failed')),
                 parameters_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
@@ -108,6 +104,8 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_builds_job_id ON builds(job_id, id DESC);
             CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);
+            CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account);
+            PRAGMA user_version = 2;
             """
         )
 
@@ -123,73 +121,168 @@ def recover_interrupted_builds() -> None:
         )
 
 
-def hash_password(password: str) -> str:
-    salt = secrets.token_bytes(16)
-    digest = hashlib.pbkdf2_hmac(
-        "sha256", password.encode("utf-8"), salt, PASSWORD_ITERATIONS
-    )
-    return f"pbkdf2_sha256${PASSWORD_ITERATIONS}${salt.hex()}${digest.hex()}"
+class AccountConfigError(RuntimeError):
+    """账号配置文件不存在或内容无效。"""
 
 
-def verify_password(password: str, encoded: str) -> bool:
-    try:
-        algorithm, iterations, salt_hex, digest_hex = encoded.split("$", 3)
-        if algorithm != "pbkdf2_sha256":
-            return False
-        digest = hashlib.pbkdf2_hmac(
-            "sha256",
-            password.encode("utf-8"),
-            bytes.fromhex(salt_hex),
-            int(iterations),
-        )
-        return hmac.compare_digest(digest.hex(), digest_hex)
-    except (TypeError, ValueError):
-        return False
+def normalize_account(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("账号必须是字符串")
+    account = unicodedata.normalize("NFKC", value).strip()
+    if not 2 <= len(account) <= 32:
+        raise ValueError("账号长度需为 2～32 个字符")
+    if not all(ch.isalnum() or ch in "._-" for ch in account):
+        raise ValueError("账号只能包含中文、字母、数字、点、下划线和短横线")
+    return account
 
 
-def validate_username(username: str) -> str:
-    username = username.strip()
-    if not 2 <= len(username) <= 32:
-        raise ValueError("用户名长度需为 2～32 个字符")
-    if not all(ch.isalnum() or ch in "._-" for ch in username):
-        raise ValueError("用户名只能包含字母、数字、点、下划线和短横线")
-    return username
+def normalize_name(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("显示名称必须是字符串")
+    name = unicodedata.normalize("NFC", value).strip()
+    if not 1 <= len(name) <= 32:
+        raise ValueError("显示名称长度需为 1～32 个字符")
+    if any(ch in "<>" or unicodedata.category(ch).startswith("C") for ch in name):
+        raise ValueError("显示名称不能包含尖括号或控制字符")
+    return name
 
 
-def add_user(username: str, password: str) -> None:
-    username = validate_username(username)
-    if len(password) < 8:
+def validate_password(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("密码必须是字符串")
+    if len(value) < 8:
         raise ValueError("密码至少需要 8 个字符")
-    with connect_db() as conn:
-        existing = conn.execute(
-            "SELECT id, disabled FROM users WHERE username=?", (username,)
-        ).fetchone()
-        if existing and not existing["disabled"]:
-            raise ValueError("用户名已存在")
-        if existing:
-            conn.execute(
-                "UPDATE users SET password_hash=?, created_at=?, disabled=0 WHERE id=?",
-                (hash_password(password), utc_now(), existing["id"]),
-            )
-            conn.execute("DELETE FROM sessions WHERE user_id=?", (existing["id"],))
-        else:
-            conn.execute(
-                "INSERT INTO users(username, password_hash, created_at) VALUES (?, ?, ?)",
-                (username, hash_password(password), utc_now()),
-            )
+    return value
 
 
-def delete_user(username: str) -> None:
-    """禁用账号并清除登录会话，保留关联的历史构建记录。"""
-    username = validate_username(username)
+def save_accounts(accounts: List[Dict[str, Any]]) -> None:
+    ACCOUNTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = ACCOUNTS_PATH.with_name(
+        f".{ACCOUNTS_PATH.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+    )
+    payload = {"accounts": accounts}
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, ACCOUNTS_PATH)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def ensure_accounts_file() -> None:
+    if not ACCOUNTS_PATH.exists():
+        save_accounts([])
+
+
+def load_accounts() -> List[Dict[str, Any]]:
+    ensure_accounts_file()
+    try:
+        payload = json.loads(ACCOUNTS_PATH.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AccountConfigError(f"无法读取 {ACCOUNTS_PATH}：{exc}") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("accounts"), list):
+        raise AccountConfigError("账号配置的顶层必须包含 accounts 数组")
+
+    accounts: List[Dict[str, Any]] = []
+    account_keys = set()
+    for index, raw in enumerate(payload["accounts"], 1):
+        if not isinstance(raw, dict):
+            raise AccountConfigError(f"第 {index} 个账号必须是对象")
+        try:
+            account = normalize_account(raw.get("account"))
+            name = normalize_name(raw.get("name"))
+            password = validate_password(raw.get("password"))
+        except ValueError as exc:
+            raise AccountConfigError(f"第 {index} 个账号无效：{exc}") from exc
+        enabled = raw.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise AccountConfigError(f"第 {index} 个账号的 enabled 必须是布尔值")
+        account_key = account.casefold()
+        if account_key in account_keys:
+            raise AccountConfigError(f"账号重复：{account}")
+        account_keys.add(account_key)
+        accounts.append(
+            {
+                "account": account,
+                "name": name,
+                "password": password,
+                "enabled": enabled,
+            }
+        )
+    return accounts
+
+
+def find_account(value: Any, include_disabled: bool = False) -> Optional[Dict[str, Any]]:
+    try:
+        account_key = normalize_account(value).casefold()
+    except ValueError:
+        return None
+    for account in load_accounts():
+        if account["account"].casefold() == account_key:
+            if account["enabled"] or include_disabled:
+                return account
+            return None
+    return None
+
+
+def account_revision(account: Dict[str, Any]) -> str:
+    identity = json.dumps(
+        {
+            "account": account["account"],
+            "name": account["name"],
+            "password": account["password"],
+            "enabled": account["enabled"],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def password_matches(password: str, account: Optional[Dict[str, Any]]) -> bool:
+    expected = account["password"] if account else ""
+    actual_digest = hashlib.sha256(password.encode("utf-8")).digest()
+    expected_digest = hashlib.sha256(expected.encode("utf-8")).digest()
+    return bool(account) and hmac.compare_digest(actual_digest, expected_digest)
+
+
+def add_user(account: str, password: str, name: Optional[str] = None) -> None:
+    account = normalize_account(account)
+    display_name = normalize_name(name if name is not None else account)
+    password = validate_password(password)
+    accounts = load_accounts()
+    if any(item["account"].casefold() == account.casefold() for item in accounts):
+        raise ValueError("账号已存在")
+    accounts.append(
+        {
+            "account": account,
+            "name": display_name,
+            "password": password,
+            "enabled": True,
+        }
+    )
+    save_accounts(accounts)
+
+
+def delete_user(account: str) -> None:
+    """从账号文件删除账号并清除其会话，构建记录保留身份快照。"""
+    account_key = normalize_account(account).casefold()
+    accounts = load_accounts()
+    removed = next(
+        (item for item in accounts if item["account"].casefold() == account_key),
+        None,
+    )
+    if not removed:
+        raise ValueError("账号不存在")
+    save_accounts(
+        [item for item in accounts if item["account"].casefold() != account_key]
+    )
     with connect_db() as conn:
-        existing = conn.execute(
-            "SELECT id, disabled FROM users WHERE username=?", (username,)
-        ).fetchone()
-        if not existing or existing["disabled"]:
-            raise ValueError("用户不存在")
-        conn.execute("UPDATE users SET disabled=1 WHERE id=?", (existing["id"],))
-        conn.execute("DELETE FROM sessions WHERE user_id=?", (existing["id"],))
+        conn.execute("DELETE FROM sessions WHERE account=?", (removed["account"],))
 
 
 def load_config() -> Dict[str, Dict[str, Any]]:
@@ -746,7 +839,7 @@ def execute_build_pipeline(
     config: Dict[str, Any],
     resource_paths: List[str],
     note: str,
-    username: str,
+    builder_name: str,
     log: TextIO,
 ) -> str:
     project_root = Path(config["project_root"])
@@ -840,7 +933,7 @@ def execute_build_pipeline(
 
     run_command(["git", "add", "-A"], project_root, log, "暂存资源修改", GIT_TIMEOUT_SECONDS, command_env)
     commit_message = f"res:{note}" if note else "res"
-    commit_author = f"relay_ota({username}) <{GIT_COMMIT_AUTHOR_EMAIL}>"
+    commit_author = f"relay_ota({builder_name}) <{GIT_COMMIT_AUTHOR_EMAIL}>"
     run_command(
         ["git", "commit", "--author", commit_author, "-m", commit_message],
         project_root,
@@ -855,12 +948,7 @@ def execute_build_pipeline(
 
 def get_build_record(build_id: int) -> Optional[Dict[str, Any]]:
     with connect_db() as conn:
-        row = conn.execute(
-            """SELECT builds.*, users.username
-               FROM builds JOIN users ON users.id=builds.user_id
-               WHERE builds.id=?""",
-            (build_id,),
-        ).fetchone()
+        row = conn.execute("SELECT * FROM builds WHERE id=?", (build_id,)).fetchone()
     return build_to_dict(row) if row else None
 
 
@@ -878,13 +966,15 @@ def create_build_record(
         ).fetchone()[0]
         cursor = conn.execute(
             """INSERT INTO builds(
-                   job_id, build_number, user_id, status, parameters_json, created_at,
-                   started_at, finished_at, duration_seconds, error_message
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   job_id, build_number, builder_account, builder_name, status,
+                   parameters_json, created_at, started_at, finished_at,
+                   duration_seconds, error_message
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 job_id,
                 build_number,
-                user["id"],
+                user["account"],
+                user["name"],
                 "queued",
                 json.dumps(parameters, ensure_ascii=False),
                 created_at,
@@ -972,7 +1062,7 @@ class BuildManager:
                 log.write(json.dumps(parameters, ensure_ascii=False, indent=2) + "\n")
                 log.flush()
                 queue_url = execute_build_pipeline(
-                    config, resource_paths, note, str(build["username"]), log
+                    config, resource_paths, note, str(build["builder_name"]), log
                 )
                 parameters["jenkins_queue_url"] = queue_url
                 update_build_parameters(build_id, parameters)
@@ -1071,12 +1161,18 @@ class AppHandler(BaseHTTPRequestHandler):
         with connect_db() as conn:
             conn.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
             row = conn.execute(
-                """SELECT users.id, users.username
-                   FROM sessions JOIN users ON users.id=sessions.user_id
-                   WHERE sessions.token_hash=? AND sessions.expires_at>=? AND users.disabled=0""",
+                """SELECT account, account_revision FROM sessions
+                   WHERE token_hash=? AND expires_at>=?""",
                 (token_hash, now),
             ).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        account = find_account(row["account"])
+        if not account or account_revision(account) != row["account_revision"]:
+            with connect_db() as conn:
+                conn.execute("DELETE FROM sessions WHERE token_hash=?", (token_hash,))
+            return None
+        return {"account": account["account"], "name": account["name"]}
 
     def _require_user(self) -> Optional[Dict[str, Any]]:
         user = self._current_user()
@@ -1094,10 +1190,13 @@ class AppHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
-        if path.startswith("/api/"):
-            self._handle_api_get(path, parse_qs(parsed.query))
-        else:
-            self._serve_static(path)
+        try:
+            if path.startswith("/api/"):
+                self._handle_api_get(path, parse_qs(parsed.query))
+            else:
+                self._serve_static(path)
+        except AccountConfigError as exc:
+            self._error(HTTPStatus.INTERNAL_SERVER_ERROR, f"账号配置错误：{exc}")
 
     def do_POST(self) -> None:
         if not self._same_origin():
@@ -1110,16 +1209,19 @@ class AppHandler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.BAD_REQUEST, str(exc))
             return
 
-        if path == "/api/login":
-            self._login(payload)
-        elif path == "/api/logout":
-            self._logout()
-        elif path.startswith("/api/jobs/") and path.endswith("/builds"):
-            user = self._require_user()
-            if user:
-                self._create_build(path.split("/")[3], payload, user)
-        else:
-            self._error(HTTPStatus.NOT_FOUND, "接口不存在")
+        try:
+            if path == "/api/login":
+                self._login(payload)
+            elif path == "/api/logout":
+                self._logout()
+            elif path.startswith("/api/jobs/") and path.endswith("/builds"):
+                user = self._require_user()
+                if user:
+                    self._create_build(path.split("/")[3], payload, user)
+            else:
+                self._error(HTTPStatus.NOT_FOUND, "接口不存在")
+        except AccountConfigError as exc:
+            self._error(HTTPStatus.INTERNAL_SERVER_ERROR, f"账号配置错误：{exc}")
 
     def _handle_api_get(self, path: str, query: Dict[str, List[str]]) -> None:
         user = self._require_user()
@@ -1159,33 +1261,38 @@ class AppHandler(BaseHTTPRequestHandler):
         self._error(HTTPStatus.NOT_FOUND, "接口不存在")
 
     def _login(self, payload: Dict[str, Any]) -> None:
-        username = str(payload.get("username", "")).strip()
+        account_value = payload.get("account", "")
         password = str(payload.get("password", ""))
-        with connect_db() as conn:
-            row = conn.execute(
-                "SELECT id, username, password_hash FROM users WHERE username=? AND disabled=0",
-                (username,),
-            ).fetchone()
-        # 即便用户不存在也做一次等成本哈希，降低用户名探测风险。
-        valid = verify_password(password, row["password_hash"]) if row else verify_password(
-            password, hash_password("invalid-password")
-        )
-        if not row or not valid:
+        account = find_account(account_value)
+        if not password_matches(password, account):
             time.sleep(0.25)
-            self._error(HTTPStatus.UNAUTHORIZED, "用户名或密码错误")
+            self._error(HTTPStatus.UNAUTHORIZED, "账号或密码错误")
             return
+        assert account is not None
         token = secrets.token_urlsafe(32)
         token_hash = hashlib.sha256(token.encode("ascii")).hexdigest()
         with connect_db() as conn:
             conn.execute(
-                "INSERT INTO sessions(token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)",
-                (token_hash, row["id"], int(time.time()) + SESSION_TTL_SECONDS, utc_now()),
+                """INSERT INTO sessions(
+                       token_hash, account, account_revision, expires_at, created_at
+                   ) VALUES (?, ?, ?, ?, ?)""",
+                (
+                    token_hash,
+                    account["account"],
+                    account_revision(account),
+                    int(time.time()) + SESSION_TTL_SECONDS,
+                    utc_now(),
+                ),
             )
         cookie = (
             f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; "
             f"Max-Age={SESSION_TTL_SECONDS}"
         )
-        self._json(HTTPStatus.OK, {"user": {"id": row["id"], "username": row["username"]}}, {"Set-Cookie": cookie})
+        self._json(
+            HTTPStatus.OK,
+            {"user": {"account": account["account"], "name": account["name"]}},
+            {"Set-Cookie": cookie},
+        )
 
     def _logout(self) -> None:
         token = self._session_token()
@@ -1220,20 +1327,14 @@ class AppHandler(BaseHTTPRequestHandler):
             limit = 50
         with connect_db() as conn:
             rows = conn.execute(
-                """SELECT builds.*, users.username
-                   FROM builds JOIN users ON users.id=builds.user_id
-                   WHERE job_id=? ORDER BY builds.id DESC LIMIT ?""",
+                "SELECT * FROM builds WHERE job_id=? ORDER BY id DESC LIMIT ?",
                 (job_id, limit),
             ).fetchall()
         self._json(HTTPStatus.OK, {"builds": [build_to_dict(row) for row in rows]})
 
     def _get_build(self, build_id: int) -> None:
         with connect_db() as conn:
-            row = conn.execute(
-                """SELECT builds.*, users.username
-                   FROM builds JOIN users ON users.id=builds.user_id WHERE builds.id=?""",
-                (build_id,),
-            ).fetchone()
+            row = conn.execute("SELECT * FROM builds WHERE id=?", (build_id,)).fetchone()
         if not row:
             self._error(HTTPStatus.NOT_FOUND, "构建记录不存在")
             return
@@ -1343,6 +1444,7 @@ class AppHandler(BaseHTTPRequestHandler):
 def serve(host: str, port: int) -> None:
     global JOBS, PATH_INDEX, BUILD_MANAGER
     init_db()
+    accounts = load_accounts()
     recover_interrupted_builds()
     JOBS = load_config()
     PATH_INDEX = PathIndex(JOBS)
@@ -1350,6 +1452,7 @@ def serve(host: str, port: int) -> None:
     server = ThreadingHTTPServer((host, port), AppHandler)
     print(f"OTA 构建工具已启动：http://{host}:{port}")
     print(f"已加载 Job：{', '.join(JOBS)}")
+    print(f"已加载账号：{len(accounts)} 个")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -1365,13 +1468,15 @@ def main() -> None:
     serve_parser = subparsers.add_parser("serve", help="启动 HTTP 服务")
     serve_parser.add_argument("--host", default="0.0.0.0")
     serve_parser.add_argument("--port", type=int, default=8765)
-    user_parser = subparsers.add_parser("add-user", help="添加本地用户")
-    user_parser.add_argument("username")
+    user_parser = subparsers.add_parser("add-user", help="添加本地账号")
+    user_parser.add_argument("account", help="唯一登录账号")
+    user_parser.add_argument("--name", help="显示名称，默认与登录账号相同")
     delete_user_parser = subparsers.add_parser(
-        "delete-user", help="删除本地用户（保留历史构建记录）"
+        "delete-user", help="删除本地账号（保留历史构建记录）"
     )
-    delete_user_parser.add_argument("username")
+    delete_user_parser.add_argument("account", help="唯一登录账号")
     delete_user_parser.add_argument("-y", "--yes", action="store_true", help="跳过确认提示")
+    subparsers.add_parser("validate-accounts", help="检查账号配置文件")
     args = parser.parse_args()
     init_db()
     if args.command == "add-user":
@@ -1380,23 +1485,29 @@ def main() -> None:
         if password != confirm:
             raise SystemExit("两次输入的密码不一致")
         try:
-            add_user(args.username, password)
-        except (ValueError, sqlite3.IntegrityError) as exc:
-            raise SystemExit(f"添加用户失败：{exc}")
-        print(f"用户 {args.username} 已添加")
+            add_user(args.account, password, args.name)
+        except (ValueError, AccountConfigError) as exc:
+            raise SystemExit(f"添加账号失败：{exc}")
+        print(f"账号 {args.account} 已添加")
     elif args.command == "delete-user":
         if not args.yes:
             answer = input(
-                f"确认删除用户 {args.username}？该用户将立即退出登录 [y/N]："
+                f"确认删除账号 {args.account}？该账号将立即退出登录 [y/N]："
             ).strip().lower()
             if answer not in ("y", "yes"):
                 print("已取消删除")
                 return
         try:
-            delete_user(args.username)
-        except ValueError as exc:
-            raise SystemExit(f"删除用户失败：{exc}")
-        print(f"用户 {args.username} 已删除，历史构建记录已保留")
+            delete_user(args.account)
+        except (ValueError, AccountConfigError) as exc:
+            raise SystemExit(f"删除账号失败：{exc}")
+        print(f"账号 {args.account} 已删除，历史构建记录已保留")
+    elif args.command == "validate-accounts":
+        try:
+            accounts = load_accounts()
+        except AccountConfigError as exc:
+            raise SystemExit(f"账号配置检查失败：{exc}")
+        print(f"账号配置有效，共 {len(accounts)} 个账号")
     else:
         serve(getattr(args, "host", "0.0.0.0"), getattr(args, "port", 8765))
 

@@ -4,7 +4,7 @@
 
 ## 已实现
 
-- SQLite 本地账号与登录会话，密码使用随机盐 + PBKDF2-SHA256 保存
+- JSON 本地账号配置与 SQLite 登录会话，账号文件支持直接编辑并即时生效
 - TP1 / TP4 Job 首页和独立构建页
 - 资源目录模糊搜索、搜索结果选择、多路径组合
 - 单线程构建池串行执行资源编译、Git 提交、Jenkins OTA 触发及结果跟踪
@@ -24,19 +24,42 @@ python3 server.py serve --host 0.0.0.0 --port 8765
 
 ## 账号管理
 
-添加账号：
+账号明文保存在 `config/accounts.json`，文件不存在时程序会自动创建空配置。`account` 是唯一登录账号，`name` 是页面与 Git 提交中显示的姓名，支持中文并允许重名：
+
+```json
+{
+  "accounts": [
+    {
+      "account": "tester01",
+      "name": "张三",
+      "password": "12345678",
+      "enabled": true
+    }
+  ]
+}
+```
+
+可以直接编辑该文件，也可以使用命令添加账号：
 
 ```bash
-python3 server.py add-user your_name
+python3 server.py add-user tester01 --name "张三"
 ```
 
 删除账号：
 
 ```bash
-python3 server.py delete-user your_name
+python3 server.py delete-user tester01
 ```
 
-删除账号会立即清除该账号的登录会话，但不会删除历史构建记录。删除过的用户名可以通过 `add-user` 重新添加并设置新密码。
+检查账号文件格式：
+
+```bash
+python3 server.py validate-accounts
+```
+
+账号和密码修改、禁用或删除后，原有登录会话会立即失效。删除账号不会影响历史构建记录，因为构建记录直接保存提交时的账号与姓名快照。真实账号文件已被 Git 忽略，格式示例见 `config/accounts.example.json`。
+
+从旧版账号数据库升级时，需要先停止服务并清空旧的 `data/`；新版启动后会自动创建不含用户表的新数据库。
 
 ## 环境变量
 
@@ -65,7 +88,7 @@ TP1 与 TP4 使用同一份 `TP_CLIENT_ROOT` 工作区，但分别切换到：
 2. 在 `TP_CLIENT_ROOT` 客户端仓库中执行相同的锁清理、`git reset --hard` 和 `git clean -fd`，递归清理现有子模块修改，然后切换对应项目主分支并拉取最新代码。
 3. 执行 `git submodule sync --recursive` 和 `git submodule update --init --recursive --force`，再递归清理子模块中的本地修改与未跟踪文件。
 4. 执行 `coffee compile.coffee res`，每条资源路径使用一个 `-d <path>` 参数；服务端会为旧版脚本补充非 TTY 输出兼容方法。
-5. 执行 `git add -A`，以 `relay_ota(登录用户名) <relay_ota@local>` 作为 author 提交并推送对应主分支（例如 `relay_ota(tester)`）；构建说明非空时提交信息为 `res:{构建说明}`，否则为 `res`。
+5. 执行 `git add -A`，以 `relay_ota(显示姓名) <relay_ota@local>` 作为 author 提交并推送对应主分支（例如 `relay_ota(张三)`）；构建说明非空时提交信息为 `res:{构建说明}`，否则为 `res`。
 6. 读取 Jenkins 参数定义，将 `branch` 固定为 `beta`、`alert` 固定为 `true`，其余布尔参数设为 `false`、其余参数设为空，然后调用 `buildWithParameters`。
 7. 轮询 Jenkins 队列和实际构建（自动修正 Jenkins 返回的 localhost 地址，并对临时查询失败进行重试），保存 OTA 版本号，直到获得最终结果并更新本地记录和日志。
 
@@ -82,7 +105,7 @@ node --check static/app.js
 
 - 仅在公司内网开放端口，并通过防火墙限制来源。
 - 若需要跨公网访问，在前面增加 Nginx/Caddy HTTPS 反向代理。
-- 将 `data/ota_tool.db` 与 `data/logs/` 纳入打包机备份。
+- 将 `config/accounts.json`、`data/ota_tool.db` 与 `data/logs/` 纳入打包机备份。
 - 真实构建脚本建议使用专用低权限系统账号运行。
 
 ## 注意事项
@@ -93,4 +116,4 @@ node --check static/app.js
 
   - `TP_RES_ROOT`：资源 Git 仓库根路径
 
-* 数据库与构建日志会保存在 `data/` 下。
+* 账号配置保存在 `config/accounts.json`，数据库与构建日志保存在 `data/` 下。
