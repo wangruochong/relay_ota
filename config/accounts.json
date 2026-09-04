@@ -5,6 +5,48 @@
       "name": "王若冲",
       "password": "88888888",
       "enabled": true
+    },
+    {
+      "account": "zhangdianwei",
+      "name": "张殿伟",
+      "password": "88888888",
+      "enabled": true
+    },
+    {
+      "account": "jiaohongye",
+      "name": "焦红业",
+      "password": "88888888",
+      "enabled": true
+    },
+    {
+      "account": "wanghong",
+      "name": "王红",
+      "password": "88888888",
+      "enabled": true
+    },
+    {
+      "account": "zhaoqian",
+      "name": "赵谦",
+      "password": "88888888",
+      "enabled": true
+    },
+    {
+      "account": "wangjintao",
+      "name": "王金涛",
+      "password": "88888888",
+      "enabled": true
+    },
+    {
+      "account": "sunzhiru",
+      "name": "孙志如",
+      "password": "88888888",
+      "enabled": true
+    },
+    {
+      "account": "xuyinghao",
+      "name": "徐英豪",
+      "password": "88888888",
+      "enabled": true
     }
   ]
 }
