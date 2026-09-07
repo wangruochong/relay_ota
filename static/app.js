@@ -13,6 +13,9 @@ const state = {
   searchTimer: null,
   searchVersion: 0,
   suppressPathFocus: false,
+  pathInputComposing: false,
+  suppressNextBuildSubmit: false,
+  imeSubmitGuardTimer: null,
   pollTimer: null,
   buildFilter: "",
   highlightedBuildId: null,
@@ -231,6 +234,10 @@ async function renderJob(jobId) {
     state.searchVersion = 0;
     state.suggestionsOpen = false;
     state.suggestionCursor = null;
+    state.pathInputComposing = false;
+    state.suppressNextBuildSubmit = false;
+    clearTimeout(state.imeSubmitGuardTimer);
+    state.imeSubmitGuardTimer = null;
     state.buildFilter = "";
     root.innerHTML = `<main class="page job-page">
       ${breadcrumbs(state.currentJob)}
@@ -437,6 +444,7 @@ function drawerHasTextSelection(drawer) {
 
 function resetBuildForm() {
   clearTimeout(state.searchTimer);
+  clearTimeout(state.imeSubmitGuardTimer);
   state.selectedPaths = [];
   state.pathQuery = "";
   state.suggestions = [];
@@ -444,6 +452,9 @@ function resetBuildForm() {
   state.suggestionCursor = null;
   state.searchTimer = null;
   state.searchVersion += 1;
+  state.pathInputComposing = false;
+  state.suppressNextBuildSubmit = false;
+  state.imeSubmitGuardTimer = null;
   document.querySelector("#build-form")?.reset();
   renderPathRows();
 }
@@ -478,6 +489,12 @@ function startPolling() {
 
 async function submitBuild(event) {
   event.preventDefault();
+  if (state.pathInputComposing || state.suppressNextBuildSubmit) {
+    state.suppressNextBuildSubmit = false;
+    clearTimeout(state.imeSubmitGuardTimer);
+    state.imeSubmitGuardTimer = null;
+    return;
+  }
   const resourcePaths = [...state.selectedPaths];
   if (!resourcePaths.length) {
     const hasInput = Boolean(state.pathQuery.trim());
@@ -734,12 +751,37 @@ document.addEventListener("input", event => {
   if (event.target.matches(".path-input")) {
     clearPathRequiredHighlight();
     state.pathQuery = event.target.value;
+    if (event.isComposing || state.pathInputComposing) return;
     searchPath(event.target.value);
   }
   if (event.target.id === "build-filter") {
     state.buildFilter = event.target.value;
     renderBuildList();
   }
+});
+
+function guardBuildSubmitForIme() {
+  state.suppressNextBuildSubmit = true;
+  clearTimeout(state.imeSubmitGuardTimer);
+  state.imeSubmitGuardTimer = window.setTimeout(() => {
+    state.suppressNextBuildSubmit = false;
+    state.imeSubmitGuardTimer = null;
+  }, 0);
+}
+
+document.addEventListener("compositionstart", event => {
+  if (!event.target.matches(".path-input")) return;
+  state.pathInputComposing = true;
+  clearTimeout(state.searchTimer);
+  state.searchVersion += 1;
+});
+
+document.addEventListener("compositionend", event => {
+  if (!event.target.matches(".path-input")) return;
+  state.pathInputComposing = false;
+  state.pathQuery = event.target.value;
+  guardBuildSubmitForIme();
+  searchPath(event.target.value);
 });
 
 document.addEventListener("focusin", event => {
@@ -780,7 +822,13 @@ document.addEventListener("keydown", event => {
     return;
   }
   const pathInput = event.target.closest?.(".path-input");
-  if (pathInput && !event.isComposing) {
+  const isImeInput = pathInput
+    && (event.isComposing || event.keyCode === 229 || state.pathInputComposing);
+  if (isImeInput) {
+    if (event.key === "Enter") guardBuildSubmitForIme();
+    return;
+  }
+  if (pathInput) {
     const suggestions = state.suggestions;
     if ((event.key === "ArrowDown" || event.key === "ArrowUp") && state.suggestionsOpen) {
       event.preventDefault();
