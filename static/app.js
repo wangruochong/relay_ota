@@ -749,7 +749,22 @@ document.addEventListener("focusin", event => {
 document.addEventListener("focusout", event => {
   if (state.suppressPathFocus || !event.target.matches(".path-input")) return;
   const wrapper = event.target.closest(".path-input-wrap");
-  if (!wrapper?.contains(event.relatedTarget)) closePathSuggestions();
+  if (wrapper?.contains(event.relatedTarget)) return;
+  window.setTimeout(() => {
+    if (!document.hasFocus()) return;
+    const currentWrapper = document.querySelector(".path-input-wrap");
+    if (!currentWrapper?.contains(document.activeElement)) closePathSuggestions();
+  }, 0);
+});
+
+function restorePathSuggestionsAfterPageFocus() {
+  if (!state.currentJob || !state.pathQuery.trim() || state.suggestionsOpen) return;
+  searchPath(state.pathQuery);
+}
+
+window.addEventListener("focus", restorePathSuggestionsAfterPageFocus);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) restorePathSuggestionsAfterPageFocus();
 });
 
 document.addEventListener("keydown", event => {
